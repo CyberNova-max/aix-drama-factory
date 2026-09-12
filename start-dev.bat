@@ -3,9 +3,12 @@ setlocal
 title MiniMax H3 Short Drama Factory V2 DEV
 cd /d "%~dp0"
 
+set "AIX_WEB_HOST=127.0.0.1"
+set "AIX_WEB_PORT=7862"
+
 echo ================================================================
 echo   MiniMax H3 Short Drama Factory V2 DEV
-echo   Web  : http://127.0.0.1:7861
+echo   Web  : http://127.0.0.1:%AIX_WEB_PORT%
 echo   Comfy: http://127.0.0.1:8190
 echo   Qwen : http://127.0.0.1:8085 (started on demand)
 echo ================================================================
@@ -17,11 +20,12 @@ if not errorlevel 1 goto :stable_busy
 netstat -ano -p tcp | findstr /R /C:"127.0.0.1:8084 .*LISTENING" >nul
 if not errorlevel 1 goto :stable_busy
 
-curl -s -m 3 http://127.0.0.1:7861/ >nul 2>&1
+curl -s -m 3 http://127.0.0.1:%AIX_WEB_PORT%/ >nul 2>&1
 if not errorlevel 1 (
-    echo [OK] V2 development web is already online. Opening it now...
-    start "" http://127.0.0.1:7861/
-    exit /b 0
+    echo [BLOCKED] Development web port %AIX_WEB_PORT% is already in use.
+    echo           Close the service on that port, then run start-dev.bat again.
+    pause
+    exit /b 3
 )
 
 set "PYTHON=%~dp0ComfyUI\python_embeded\python.exe"
@@ -39,7 +43,7 @@ if errorlevel 1 (
     echo [OK] Development ComfyUI is already online.
 )
 
-echo [INFO] Starting V2 development web at http://127.0.0.1:7861
+echo [INFO] Starting V2 development web at http://127.0.0.1:%AIX_WEB_PORT%
 "%PYTHON%" app.py
 pause
 exit /b %ERRORLEVEL%
