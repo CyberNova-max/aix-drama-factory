@@ -310,5 +310,276 @@ class RuntimeConfigTests(unittest.TestCase):
         command.assert_called_once_with('AIX_COMFY_STOP_COMMAND')
 
 
+class ShotRetryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.old_projects_dir = factory.PROJECTS_DIR
+        self.old_outputs_dir = factory.OUTPUTS_DIR
+        factory.PROJECTS_DIR = self.temp_dir.name
+        factory.OUTPUTS_DIR = os.path.join(self.temp_dir.name, 'outputs')
+        os.makedirs(factory.OUTPUTS_DIR, exist_ok=True)
+        self.release_project_jobs()
+        self.client = factory.app.test_client()
+
+    def tearDown(self):
+        self.release_project_jobs()
+        factory.PROJECTS_DIR = self.old_projects_dir
+        factory.OUTPUTS_DIR = self.old_outputs_dir
+        self.temp_dir.cleanup()
+
+    def release_project_jobs(self):
+        for pid, (job_id, _handle) in list(factory._PROJECT_JOB_HANDLES.items()):
+            factory.release_project_job(pid, job_id)
+
+    def save_failed_project(self, pid='retry-project', shot_count=1):
+        shots = [
+            {
+                'index': index, 'segment_id': f'EP01-{index:02d}',
+                'duration': 8, 'characters': [], 'props': [],
+                'scene': '', 'action': f'片段{index}', 'dialogue': [],
+            }
+            for index in range(1, shot_count + 1)
+        ]
+        project = {
+            'id': pid, 'idea': '测试故事', 'input_mode': 'story', 'title': '重试测试',
+            'script': {'title': '重试测试', 'characters': [], 'scenes': [], 'props': [], 'shots': shots},
+            'assets': {}, 'shots': [], 'prompts': {str(index): f'提示词{index}' for index in range(1, shot_count + 1)},
+            'item_states': {'shots': {
+                '1': {'status': 'failed', 'progress': 0, 'message': '首次生成失败', 'error': '首次生成失败'},
+            }},
+            'final': None, 'created': 1,
+        }
+        factory.save_project(project)
+        return project
+
+    @patch.object(factory.threading, 'Thread')
+    def test_retry_api_queues_failed_segment_and_rejects_duplicate(self, thread_cls):
+        self.save_failed_project()
+
+        response = self.client.post('/api/project/retry-project/shot/1/retry')
+        self.assertEqual(response.status_code, 202)
+        data = response.get_json()
+        self.assertTrue(data['ok'])
+        self.assertEqual(data['item_state']['status'], 'retrying')
+        self.assertEqual(data['item_state']['retry_count'], 1)
+        thread_cls.return_value.start.assert_called_once_with()
+
+        saved = factory.load_project('retry-project')
+        state = saved['item_states']['shots']['1']
+        self.assertEqual(state['original_error'], '首次生成失败')
+        self.assertEqual(state['retry_count'], 1)
+
+        duplicate = self.client.post('/api/project/retry-project/shot/1/retry')
+        self.assertEqual(duplicate.status_code, 409)
+        self.assertIn('已有生成任务', duplicate.get_json()['msg'])
+
+    @patch.object(factory.threading, 'Thread')
+    def test_project_lock_rejects_a_different_segment_retry(self, _thread_cls):
+        project = self.save_failed_project(shot_count=2)
+        project['item_states']['shots']['2'] = {
+            'status': 'failed', 'progress': 0, 'message': '第二片失败', 'error': '第二片失败',
+        }
+        factory.save_project(project)
+
+        first = self.client.post('/api/project/retry-project/shot/1/retry')
+        second = self.client.post('/api/project/retry-project/shot/2/retry')
+
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(second.status_code, 409)
+        self.assertIn('已有生成任务', second.get_json()['msg'])
+
+    @patch.object(factory.threading, 'Thread')
+    def test_retry_revalidates_project_after_claiming_lock(self, thread_cls):
+        self.save_failed_project()
+        original_claim = factory.claim_project_job
+
+        def claim_after_previous_completion(pid, job_id):
+            claimed = original_claim(pid, job_id)
+            if claimed:
+                latest = factory.load_project(pid)
+                latest['shots'] = [{
+                    'index': 1, 'video_url': '/file/outputs/retry-project/shot_01.mp4',
+                    'path': 'outputs/retry-project/shot_01.mp4',
+                }]
+                latest['item_states']['shots']['1']['status'] = 'done'
+                factory.save_project(latest)
+            return claimed
+
+        with patch.object(factory, 'claim_project_job', side_effect=claim_after_previous_completion):
+            response = self.client.post('/api/project/retry-project/shot/1/retry')
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn('已经生成完成', response.get_json()['msg'])
+        self.assertFalse(factory.project_job_active('retry-project'))
+        thread_cls.return_value.start.assert_not_called()
+
+    def test_retry_revalidation_error_releases_project_lock(self):
+        self.save_failed_project()
+        original_claim = factory.claim_project_job
+        original_load = factory.load_project
+        retry_claimed = False
+
+        def tracking_claim(pid, job_id):
+            nonlocal retry_claimed
+            claimed = original_claim(pid, job_id)
+            if claimed and not job_id.startswith('recovery-'):
+                retry_claimed = True
+            return claimed
+
+        def fail_after_retry_claim(pid):
+            if retry_claimed:
+                raise PermissionError('project temporarily unreadable')
+            return original_load(pid)
+
+        with patch.object(factory, 'claim_project_job', side_effect=tracking_claim), \
+                patch.object(factory, 'load_project', side_effect=fail_after_retry_claim):
+            response = self.client.post('/api/project/retry-project/shot/1/retry')
+
+        self.assertEqual(response.status_code, 500)
+        self.assertFalse(factory.project_job_active('retry-project'))
+
+    @patch.object(factory, 'save_config')
+    def test_project_lock_rejects_full_pipeline_while_retry_is_active(self, _save_config):
+        self.save_failed_project()
+        self.assertTrue(factory.claim_project_job('retry-project', 'active-retry'))
+
+        response = self.client.get('/api/pipeline/run?pid=retry-project&idea=测试故事')
+        body = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('event: pipeline_error', body)
+        self.assertIn('已有生成任务', body)
+
+    @patch.object(factory, 'find_ffmpeg')
+    @patch.object(factory, 'comfy_download')
+    @patch.object(factory, 'gen_video_r2v', return_value=({'filename': 'video.mp4'}, None))
+    @patch.object(factory, 'assemble_shot_refs', return_value=(['ref.png'], None, None))
+    @patch.object(factory, 'prepare_comfy_stage', return_value=True)
+    def test_retry_pipeline_generates_only_selected_segment(
+            self, _prepare, _refs, generate, _download, ffmpeg):
+        project = self.save_failed_project(shot_count=3)
+        project['shots'] = [{
+            'index': 1, 'segment_id': 'EP01-01', 'video_url': '/file/outputs/retry-project/shot_01.mp4',
+            'prompt': '原提示词1', 'path': 'existing-shot-01.mp4', 'refs': ['old-ref.png'], 'duration': 8,
+        }]
+        project['item_states']['shots'] = {
+            '1': {'status': 'done', 'progress': 100, 'message': '片段已完成'},
+            '2': {'status': 'failed', 'progress': 0, 'message': '第二片失败', 'error': '第二片失败'},
+            '3': {'status': 'waiting', 'progress': 0, 'message': '等待生成'},
+        }
+        factory.save_project(project)
+
+        job_id = 'retry-job'
+        self.assertTrue(factory.claim_project_job('retry-project', job_id))
+        factory.run_project_shot_retry('retry-project', 2, job_id)
+
+        saved = factory.load_project('retry-project')
+        self.assertEqual(sorted(shot['index'] for shot in saved['shots']), [1, 2])
+        self.assertEqual(next(shot for shot in saved['shots'] if shot['index'] == 1)['prompt'], '原提示词1')
+        self.assertEqual(saved['item_states']['shots']['2']['status'], 'done')
+        self.assertEqual(saved['item_states']['shots']['3']['status'], 'waiting')
+        self.assertIsNone(saved.get('final'))
+        generate.assert_called_once()
+        ffmpeg.assert_not_called()
+        self.assertEqual(saved['production_job']['status'], 'partial')
+        self.assertIn('仍有1个片段待生成', saved['production_job']['message'])
+
+    def test_project_read_recovers_interrupted_retry(self):
+        project = self.save_failed_project()
+        project['item_states']['shots']['1'].update({'status': 'retrying', 'retry_count': 2})
+        factory.save_project(project)
+
+        self.assertTrue(factory.claim_project_job('retry-project', 'active-job'))
+        active_response = self.client.get('/api/project/retry-project')
+        self.assertEqual(active_response.get_json()['project']['item_states']['shots']['1']['status'], 'retrying')
+        factory.release_project_job('retry-project', 'active-job')
+
+        response = self.client.get('/api/project/retry-project')
+
+        self.assertEqual(response.status_code, 200)
+        state = response.get_json()['project']['item_states']['shots']['1']
+        self.assertEqual(state['status'], 'failed')
+        self.assertEqual(state['retry_count'], 2)
+        self.assertIn('重试中断', state['message'])
+
+    def test_project_read_recovers_interrupted_full_pipeline(self):
+        project = self.save_failed_project()
+        project['production_job'] = {'status': 'running', 'message': '正在生成短剧'}
+        factory.save_project(project)
+
+        response = self.client.get('/api/project/retry-project')
+
+        self.assertEqual(response.status_code, 200)
+        job = response.get_json()['project']['production_job']
+        self.assertEqual(job['status'], 'failed')
+        self.assertIn('生成任务中断', job['message'])
+
+    def test_project_read_recovers_interrupted_final_merge(self):
+        project = self.save_failed_project()
+        project['shots'] = [{
+            'index': 1, 'video_url': '/file/outputs/retry-project/shot_01.mp4',
+            'path': 'outputs/retry-project/shot_01.mp4',
+        }]
+        project['item_states']['shots']['1']['status'] = 'done'
+        project['production_job'] = {
+            'status': 'merging', 'stage': 'finalizing', 'message': '正在合并所有片段',
+        }
+        factory.save_project(project)
+
+        response = self.client.get('/api/project/retry-project')
+
+        job = response.get_json()['project']['production_job']
+        self.assertEqual(job['status'], 'failed')
+        self.assertEqual(job['stage'], 'finalizing')
+        self.assertIn('视频合成中断', job['message'])
+
+    @patch('builtins.open', side_effect=PermissionError('read only'))
+    def test_project_lock_open_failure_is_reported_as_unavailable(self, _open):
+        self.assertIsNone(factory._lock_project_job_file('retry-project'))
+
+    @patch.object(factory.threading, 'Thread')
+    def test_retry_post_recovers_stale_retry_without_prior_poll(self, _thread_cls):
+        project = self.save_failed_project()
+        project['item_states']['shots']['1'].update({'status': 'retrying', 'retry_count': 2})
+        project['production_job'] = {'status': 'retrying', 'message': '正在重试'}
+        factory.save_project(project)
+
+        response = self.client.post('/api/project/retry-project/shot/1/retry')
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json()['item_state']['retry_count'], 3)
+
+    @patch.object(factory, 'find_ffmpeg', return_value=None)
+    @patch.object(factory, 'comfy_download')
+    @patch.object(factory, 'gen_video_r2v', return_value=({'filename': 'video.mp4'}, None))
+    @patch.object(factory, 'assemble_shot_refs', return_value=(['ref.png'], None, None))
+    @patch.object(factory, 'prepare_comfy_stage', return_value=True)
+    def test_final_merge_failure_keeps_retried_segment_done(
+            self, _prepare, _refs, _generate, _download, _ffmpeg):
+        self.save_failed_project()
+        job_id = 'merge-failure-job'
+        self.assertTrue(factory.claim_project_job('retry-project', job_id))
+
+        factory.run_project_shot_retry('retry-project', 1, job_id)
+
+        saved = factory.load_project('retry-project')
+        self.assertEqual(saved['item_states']['shots']['1']['status'], 'done')
+        self.assertEqual(saved['production_job']['status'], 'failed')
+        self.assertEqual(saved['production_job']['stage'], 'finalizing')
+        self.assertIsNone(saved.get('final'))
+        response = self.client.post('/api/project/retry-project/shot/1/retry')
+        self.assertEqual(response.status_code, 409)
+        self.assertIn('已经生成完成', response.get_json()['msg'])
+
+    @patch.object(factory, 'set_item_state', side_effect=OSError('disk unavailable'))
+    def test_retry_queue_save_failure_releases_project_lock(self, _set_state):
+        self.save_failed_project()
+
+        response = self.client.post('/api/project/retry-project/shot/1/retry')
+
+        self.assertEqual(response.status_code, 500)
+        self.assertFalse(factory.project_job_active('retry-project'))
+
+
 if __name__ == '__main__':
     unittest.main()
