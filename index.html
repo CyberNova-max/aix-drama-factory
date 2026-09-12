@@ -1413,7 +1413,11 @@ async function applySingleReplace(){
 function remakeShot(idx){
   if(!currentPid){alert('没有活动项目');return;}
   const d=SHOT_DATA[idx]||{index:idx};
-  if(!d.refs||!d.refs.length){alert('该镜头还没有生成记录，请先运行一遍流水线');return;}
+  if(!d.refs||!d.refs.length){
+    log(`片段 ${d.segment_id||idx} 尚未成功保存，正在从该项目断点续跑…`,'gold');
+    runPipeline(currentPid);
+    return;
+  }
   openSingle({mode:'r2v',prompt:d.prompt||'',duration:d.duration||8,refs:d.refs,replace:{pid:currentPid,index:idx}});
 }
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.0.0-dev.11 - 2026-09-12
+
+- Fixed 24 GB GPU out-of-memory failures by removing the TE-Speed layer cache from all bundled H3 workflows; retained INT8/SageAttention and added four-way low-VRAM attention and feed-forward chunking.
+- Fixed the remake action for a failed segment with no saved successful record so it resumes the existing project pipeline from its checkpoint instead of blocking the user.
+- Added safe, project-scoped stopping for the full production pipeline, individual and batch asset generation, failed-segment retries, and guided outline/script/prompt generation.
+- Persisted `running`, `stopping`, and `stopped` states so refresh or service restart restores a clear task state and users can continue from saved results.
+- Preserved completed assets, prompts, and video segments when stopping; stale pages cannot stop a newer run.
+- Added exact ComfyUI job cancellation when supported and exact pending-job deletion on older versions, without calling the global interrupt endpoint or affecting unrelated queue items.
+- Isolated the Windows development Web server on `127.0.0.1:7862`, separate from the production default `7861`.
+- Made the development launcher reject IPv4, wildcard, IPv6, non-HTTP, or unhealthy services already listening on port 7862.
+- Added regression coverage for stop/completion races, refresh recovery, partial prompt preservation, project ownership, cross-process locks, and development-port detection.
+
 ## 2.0.0-dev.10 - 2026-09-12
 
 - Added a per-segment retry action when an H3 video segment fails.
