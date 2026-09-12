@@ -1,0 +1,10 @@
+{
+  "director_core_v3": false,
+  "persistent_task_engine": false,
+  "continuity_matrix": false,
+  "scene_package_v2": false,
+  "h3_compiler_v2": false,
+  "shot_versions": false,
+  "unified_ui_v2": false,
+  "guided_preproduction": true
+}

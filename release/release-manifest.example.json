@@ -1,0 +1,52 @@
+{
+  "schema_version": "1.0",
+  "product": "aix-drama-factory",
+  "repository": "https://github.com/sengseng123/aix-drama-factory",
+  "license": "AGPL-3.0-only",
+  "version": "VERSION",
+  "channel": "development",
+  "modules": {
+    "web": {
+      "version": "VERSION",
+      "required": true,
+      "entrypoint": "start-web.bat",
+      "health": "http://127.0.0.1:7861/api/status"
+    },
+    "runtime_core": {
+      "version": "TO_BE_PINNED",
+      "required_when": "managed",
+      "contains": ["comfyui", "python", "custom_nodes", "llama.cpp", "ffmpeg"],
+      "models_included": false
+    },
+    "model_catalog": {
+      "version": "TO_BE_PINNED",
+      "packs": ["h3-base", "qwen-writing", "asset-image", "h3-quality"]
+    }
+  },
+  "compatibility": {
+    "comfyui_api": ["system_stats", "queue", "prompt", "history", "view", "upload/image", "object_info"],
+    "llm_api": "openai-compatible",
+    "managed_defaults": {
+      "web_url": "http://127.0.0.1:7861",
+      "comfyui_url": "http://127.0.0.1:8190",
+      "llm_url": "http://127.0.0.1:8085"
+    }
+  },
+  "verification": {
+    "artifact_hashes": "sha256sums.txt",
+    "checks": [
+      "runtime_files",
+      "comfyui_health",
+      "required_nodes",
+      "selected_model_profile",
+      "llm_health",
+      "ffmpeg",
+      "write_permissions",
+      "free_disk_space"
+    ]
+  },
+  "security": {
+    "default_bind": "127.0.0.1",
+    "secrets_in_manifest": false
+  }
+}

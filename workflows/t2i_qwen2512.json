@@ -1,0 +1,177 @@
+{
+  "json": {
+    "133": {
+      "inputs": {
+        "unet_name": "Qwen\\qwen-image-2512-Q4_K_S.gguf"
+      },
+      "class_type": "UnetLoaderGGUF",
+      "_meta": {
+        "title": "Unet Loader (GGUF)"
+      }
+    },
+    "134": {
+      "inputs": {
+        "lora_name": "Qwen\\Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors",
+        "strength_model": 1,
+        "model": [
+          "133",
+          0
+        ]
+      },
+      "class_type": "LoraLoaderModelOnly",
+      "_meta": {
+        "title": "LORA加载器（仅模型）"
+      }
+    },
+    "138": {
+      "inputs": {
+        "vae_name": "qwen_image_vae.safetensors"
+      },
+      "class_type": "VAELoader",
+      "_meta": {
+        "title": "加载VAE"
+      }
+    },
+    "140": {
+      "inputs": {
+        "text": "",
+        "clip": [
+          "149",
+          0
+        ]
+      },
+      "class_type": "CLIPTextEncode",
+      "_meta": {
+        "title": "CLIP Text Encode (Positive Prompt)"
+      }
+    },
+    "141": {
+      "inputs": {
+        "filename_prefix": "Qwen-Image-2512",
+        "images": [
+          "145",
+          0
+        ]
+      },
+      "class_type": "SaveImage",
+      "_meta": {
+        "title": "保存图像"
+      }
+    },
+    "142": {
+      "inputs": {
+        "shift": 3.1,
+        "model": [
+          "134",
+          0
+        ]
+      },
+      "class_type": "ModelSamplingAuraFlow",
+      "_meta": {
+        "title": "采样算法（AuraFlow）"
+      }
+    },
+    "144": {
+      "inputs": {
+        "text": "低分辨率，低画质，肢体畸形，手指畸形，画面过饱和，蜡像感，人脸无细节，过度光滑，画面具有AI感。构图混乱。文字模糊，扭曲",
+        "clip": [
+          "149",
+          0
+        ]
+      },
+      "class_type": "CLIPTextEncode",
+      "_meta": {
+        "title": "CLIP Text Encode (Negative Prompt)"
+      }
+    },
+    "145": {
+      "inputs": {
+        "samples": [
+          "148",
+          0
+        ],
+        "vae": [
+          "138",
+          0
+        ]
+      },
+      "class_type": "VAEDecode",
+      "_meta": {
+        "title": "VAE解码"
+      }
+    },
+    "148": {
+      "inputs": {
+        "seed": 655373609159919,
+        "steps": 6,
+        "cfg": 1,
+        "sampler_name": "euler",
+        "scheduler": "simple",
+        "denoise": 1,
+        "model": [
+          "142",
+          0
+        ],
+        "positive": [
+          "140",
+          0
+        ],
+        "negative": [
+          "144",
+          0
+        ],
+        "latent_image": [
+          "156",
+          0
+        ]
+      },
+      "class_type": "KSampler",
+      "_meta": {
+        "title": "K采样器"
+      }
+    },
+    "149": {
+      "inputs": {
+        "clip_name": "Qwen2.5-VL-7B-Instruct-Q3_K_S.gguf",
+        "type": "qwen_image"
+      },
+      "class_type": "CLIPLoaderGGUF",
+      "_meta": {
+        "title": "CLIPLoader (GGUF)"
+      }
+    },
+    "156": {
+      "inputs": {
+        "width": 1280,
+        "height": 720,
+        "batch_size": 1
+      },
+      "class_type": "EmptySD3LatentImage",
+      "_meta": {
+        "title": "空Latent图像（SD3）"
+      }
+    }
+  },
+  "map": {
+    "seed": [
+      "148",
+      "seed"
+    ],
+    "prompt": [
+      "140",
+      "text"
+    ],
+    "negative": [
+      "144",
+      "text"
+    ],
+    "width": [
+      "156",
+      "width"
+    ],
+    "height": [
+      "156",
+      "height"
+    ]
+  }
+}

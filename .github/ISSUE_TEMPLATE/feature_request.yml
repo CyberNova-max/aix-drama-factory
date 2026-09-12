@@ -1,0 +1,58 @@
+name: Feature Request
+description: 提议新功能或现有体验改进
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: input
+    id: feature
+    attributes:
+      label: 功能名称
+      placeholder: 用一句话概括功能
+    validations:
+      required: true
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 使用场景
+      description: 谁会在什么情况下使用这个功能？
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: 当前问题
+      description: 目前的流程有什么困难或限制？
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: 希望实现的效果
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议方案
+      description: 可填写交互、接口、兼容性或替代方案；不知道可以留空。
+  - type: dropdown
+    id: participation
+    attributes:
+      label: 是否愿意参与开发
+      options:
+        - 愿意开发并提交 PR
+        - 愿意协助测试或提供素材
+        - 暂时只能提供需求
+    validations:
+      required: true
+  - type: textarea
+    id: additional
+    attributes:
+      label: 补充信息
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索现有 Issue，未发现相同建议。
+          required: true

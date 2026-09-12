@@ -1,0 +1,49 @@
+{
+  "schema_version": "1.0",
+  "packs": [
+    {
+      "id": "h3-base",
+      "label": "H3 基础视频包",
+      "required_for": ["video"],
+      "files": [
+        {
+          "filename": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+          "target": "diffusion_models/",
+          "size_bytes": null,
+          "sha256": "TO_BE_FILLED",
+          "source_url": "TO_BE_FILLED",
+          "license": "TO_BE_AUDITED",
+          "redistribution_allowed": null
+        },
+        {
+          "filename": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+          "target": "diffusion_models/",
+          "size_bytes": null,
+          "sha256": "TO_BE_FILLED",
+          "source_url": "TO_BE_FILLED",
+          "license": "TO_BE_AUDITED",
+          "redistribution_allowed": null
+        }
+      ]
+    },
+    {
+      "id": "qwen-writing",
+      "label": "Qwen 文案包",
+      "required_for": ["story", "outline", "prompt_compilation"],
+      "files": []
+    },
+    {
+      "id": "asset-image",
+      "label": "资产生图包",
+      "required_for": ["automatic_assets"],
+      "files": []
+    },
+    {
+      "id": "h3-quality",
+      "label": "H3 质量增强包",
+      "required_for": [],
+      "optional": true,
+      "files": []
+    }
+  ]
+}

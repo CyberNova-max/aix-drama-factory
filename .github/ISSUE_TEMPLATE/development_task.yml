@@ -1,0 +1,64 @@
+name: Development Task
+description: 创建可认领、可验收的多人协作任务
+title: "[Task]: "
+labels: [help wanted]
+body:
+  - type: textarea
+    id: objective
+    attributes:
+      label: 任务目标
+      description: 说明完成后应解决什么问题。
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: 工作内容
+      description: 列出任务范围，并说明明确不包含的内容。
+    validations:
+      required: true
+  - type: textarea
+    id: modules
+    attributes:
+      label: 涉及模块
+      placeholder: 例如 backend / frontend / workflow / docs
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准
+      placeholder: |
+        - [ ] 场景一……
+        - [ ] 自动测试……
+        - [ ] 文档……
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: 依赖项
+      description: 填写关联 Issue、前置任务、环境或外部资源；没有请填写“无”。
+    validations:
+      required: true
+  - type: input
+    id: developer
+    attributes:
+      label: 开发者
+      description: 填写 GitHub 用户名；未认领可写“待认领”。
+      placeholder: "@username / 待认领"
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: 备注
+  - type: checkboxes
+    id: coordination
+    attributes:
+      label: 协作确认
+      options:
+        - label: 我已检查现有 Issue 和 PR，确认没有重复开发。
+          required: true
+        - label: 如涉及大改，我已先记录讨论结论和兼容性影响。
+          required: true
