@@ -14,6 +14,7 @@ AIX 短剧工厂是面向本地 AI 视频生产的 Web 工作台，把故事/剧
 - 停止仅作用于当前项目拥有的任务，不会清空或全局中断其他 ComfyUI 队列；已完成的资产、提示词和视频片段会保留。
 - 运行、停止中和已停止状态均会保存，刷新页面或服务重启后仍能恢复，并允许从断点重新生成。
 - Windows 开发网页固定使用 `127.0.0.1:7862`，与正式版默认的 `7861` 隔离；端口被 IPv4、IPv6 或非网页程序占用时会阻止误启动。
+- 修复中文 Windows 环境下桌面壳强制 UTF-8 时无法读取本地化端口信息、进而导致服务切换失败的问题。
 
 同时包含 `v2.0.0-dev.10` 已发布的失败片段修复：
 
@@ -60,9 +61,9 @@ AIX 短剧工厂是面向本地 AI 视频生产的 Web 工作台，把故事/剧
 
 只使用完整 H3 提示词入口时可不安装 Qwen 文案模型；自动故事、剧本和提示词功能需要 OpenAI 兼容 LLM。更详细的开发目录规则见 [DEV-README.md](DEV-README.md)，三模块发布方式见 [DISTRIBUTION.md](DISTRIBUTION.md)。
 
-## 从 dev.9 更新
+## 从 dev.9 / dev.10 更新
 
-GitHub Release 附件 `AIX-DramaFactory-V2-2.0.0-dev.10-update.zip` 面向已安装 `v2.0.0-dev.9` 的 V2 Web Windows 用户，不包含模型、ComfyUI、Qwen、项目、素材或成片。下载后先用同名 `.sha256.txt` 校验，关闭 AIX Web 后再按包内说明更新。
+GitHub Release 附件 `AIX-DramaFactory-V2-2.0.0-dev.11-update.zip` 面向已安装 `v2.0.0-dev.9` 或 `v2.0.0-dev.10` 的 V2 Web Windows 用户，不包含模型、ComfyUI、Qwen、项目、素材或成片。下载后先用同名 `.sha256.txt` 校验，关闭 AIX Web 后再按包内说明更新。
 
 ## 参与贡献
 
