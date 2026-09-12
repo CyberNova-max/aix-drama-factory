@@ -15,11 +15,15 @@ class DevLauncherTests(unittest.TestCase):
     def run_with_listener(self, local_endpoint):
         with tempfile.TemporaryDirectory() as directory:
             fake_netstat = Path(directory) / 'netstat.cmd'
-            fake_netstat.write_text(
-                '@echo off\r\n'
-                f'echo   TCP    {local_endpoint}    0.0.0.0:0    LISTENING    4242\r\n',
-                encoding='utf-8',
-            )
+            lines = ['@echo off']
+            if local_endpoint.startswith('['):
+                lines.extend([
+                    'echo %* | findstr /I /C:"-p tcp" >nul',
+                    'if not errorlevel 1 exit /b 0',
+                ])
+            lines.append(
+                f'echo   TCP    {local_endpoint}    0.0.0.0:0    LISTENING    4242')
+            fake_netstat.write_text('\r\n'.join(lines) + '\r\n', encoding='utf-8')
             env = os.environ.copy()
             env['PATH'] = directory + os.pathsep + env.get('PATH', '')
             return subprocess.run(
