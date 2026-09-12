@@ -412,7 +412,11 @@ def kill_by_port(port):
     if os.name != 'nt':
         return False
     try:
-        out = subprocess.run(['netstat', '-ano'], capture_output=True, text=True, timeout=15).stdout
+        raw = subprocess.run(['netstat', '-ano'], capture_output=True, timeout=15).stdout or b''
+        # Windows 本地化命令通常使用系统 ANSI 代码页输出。桌面壳可能强制
+        # Python 使用 UTF-8；让 subprocess 自动解码会令读取线程崩溃，并把
+        # stdout 留成 None。显式按 Windows 代码页容错解码，避免切换服务失败。
+        out = raw.decode('mbcs', errors='replace') if isinstance(raw, bytes) else str(raw)
     except Exception:
         return False
     pids = {ln.split()[-1] for ln in out.splitlines() if f':{port}' in ln and 'LISTENING' in ln}
