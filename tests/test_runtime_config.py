@@ -55,6 +55,20 @@ class RuntimeConfigTests(unittest.TestCase):
         kill.assert_not_called()
         self.assertFalse(factory.exclusive_on())
 
+    @patch.object(factory.subprocess, 'run')
+    def test_kill_by_port_accepts_windows_local_codepage_output(self, run):
+        netstat = Mock(stdout=(
+            '活动连接\r\n'
+            '  TCP    127.0.0.1:8190    0.0.0.0:0    LISTENING    4321\r\n'
+        ).encode('mbcs'))
+        taskkill = Mock(stdout=b'')
+        run.side_effect = [netstat, taskkill]
+
+        self.assertTrue(factory.kill_by_port(8190))
+        self.assertEqual(run.call_args_list[0].args[0], ['netstat', '-ano'])
+        self.assertNotIn('text', run.call_args_list[0].kwargs)
+        self.assertEqual(run.call_args_list[1].args[0], ['taskkill', '/PID', '4321', '/F'])
+
     def test_configured_ffmpeg_path_has_priority(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, 'ffmpeg.exe')

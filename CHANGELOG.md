@@ -10,6 +10,7 @@
 - Added exact ComfyUI job cancellation when supported and exact pending-job deletion on older versions, without calling the global interrupt endpoint or affecting unrelated queue items.
 - Isolated the Windows development Web server on `127.0.0.1:7862`, separate from the production default `7861`.
 - Made the development launcher reject IPv4, wildcard, IPv6, non-HTTP, or unhealthy services already listening on port 7862.
+- Fixed Windows service switching when a desktop launcher forces UTF-8 but localized `netstat` output uses the system code page.
 - Added regression coverage for stop/completion races, refresh recovery, partial prompt preservation, project ownership, cross-process locks, and development-port detection.
 
 ## 2.0.0-dev.10 - 2026-09-12
