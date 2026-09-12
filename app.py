@@ -278,7 +278,7 @@ def get_llm_endpoint():
         return base, CONFIG.get('custom_api_key', 'EMPTY'), CONFIG.get('custom_model', '')
     return CONFIG.get('local_llm_url', 'http://127.0.0.1:8085').rstrip('/'), 'EMPTY', CONFIG.get('local_llm_model', 'qwen3.5-4b')
 
-def llm_chat(messages, max_tokens=4096, temperature=0.7, retries=None):
+def llm_chat(messages, max_tokens=4096, temperature=0.7, retries=None, stop_check=None):
     if retries is None:
         retries = max(0, int(CONFIG.get('llm_retries', 3)))
     base, key, model = get_llm_endpoint()
@@ -294,6 +294,8 @@ def llm_chat(messages, max_tokens=4096, temperature=0.7, retries=None):
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
     last_err = None
     for attempt in range(retries + 1):
+        if stop_check and stop_check():
+            raise ProjectStopRequested('当前项目已收到停止请求')
         try:
             r = requests.post(f"{base}/chat/completions", json=payload, headers=headers, timeout=600)
             r.raise_for_status()
@@ -307,6 +309,8 @@ def llm_chat(messages, max_tokens=4096, temperature=0.7, retries=None):
         except Exception as e:
             last_err = str(e)
             print(f"[LLM] 第{attempt+1}次调用失败: {e}")
+            if stop_check and stop_check():
+                raise ProjectStopRequested('当前项目已收到停止请求')
             http_server_error = (isinstance(e, requests.exceptions.HTTPError) and
                                  getattr(e.response, 'status_code', 0) >= 500)
             retryable_service_error = isinstance(e, (requests.exceptions.ConnectionError,
@@ -315,11 +319,16 @@ def llm_chat(messages, max_tokens=4096, temperature=0.7, retries=None):
                            CONFIG.get('llm_mode') == 'local' and
                            CONFIG.get('llm_auto_recover', True))
             if can_recover:
+                if stop_check and stop_check():
+                    raise ProjectStopRequested('当前项目已收到停止请求')
                 print("[LLM] 检测到本地服务中断，正在自动恢复；恢复后重试当前请求...")
                 ok, recover_err = ensure_local_llm()
                 if not ok:
                     last_err = f"本地LLM自动恢复失败: {recover_err}"
                     print(f"[LLM] {last_err}")
+        if stop_check and stop_check():
+            raise ProjectStopRequested('当前项目已收到停止请求')
+        if attempt < retries:
             time.sleep(2)
     return None, last_err
 
@@ -1613,7 +1622,7 @@ def validate_h3_production_prompt(content, dialogue_lines, ref_count, include_wa
     return list(dict.fromkeys(result))
 
 def repair_h3_production_prompt(sys_text, user_content, content, issues,
-                                dialogue_lines, ref_count):
+                                dialogue_lines, ref_count, stop_check=None):
     """格式不合格时低温重编译一次；仍不合格则拒绝把污染提示词送入H3。"""
     issue_text = "\n".join(f"- {item}" for item in issues)
     repair_request = (
@@ -1623,12 +1632,14 @@ def repair_h3_production_prompt(sys_text, user_content, content, issues,
         "speaker/XML tag, screenplay name-colon line, dialogue repetition, and pause direction. "
         "Return only the complete corrected prompt in the required six-section order."
     )
+    if stop_check and stop_check():
+        raise ProjectStopRequested('当前项目已收到停止请求')
     fixed, err = llm_chat([
         {"role": "system", "content": sys_text},
         {"role": "user", "content": user_content},
         {"role": "assistant", "content": content},
         {"role": "user", "content": repair_request}
-    ], max_tokens=3000, temperature=0.2)
+    ], max_tokens=3000, temperature=0.2, stop_check=stop_check)
     if not fixed:
         return None, err or "提示词格式修复无返回"
     fixed = fixed.strip()
@@ -1928,7 +1939,7 @@ def character_ref_paths_for_prompt(shot, assets):
     return paths
 
 def gen_shot_h3_prompt(shot, ref_paths=None, storyboard_ref_index=None, character_profiles=None,
-                       continuity_ref_index=None):
+                       continuity_ref_index=None, stop_check=None):
     """用LLM为一个剧情片段编写含多个内部Shot的H3提示词。返回(prompt, err)。
     Picture编号规则与实际渲染时的ref_paths组装顺序严格一致（每片上限9张）：
     全部出场角色（四宫格三视图）→ 场景 → 道具，按顺序编号"""
@@ -1996,9 +2007,11 @@ def gen_shot_h3_prompt(shot, ref_paths=None, storyboard_ref_index=None, characte
     content, err = llm_chat([
         {"role": "system", "content": sys_text},
         {"role": "user", "content": user_content}
-    ], max_tokens=3000, temperature=0.35)
+    ], max_tokens=3000, temperature=0.35, stop_check=stop_check)
     if not content:
         return None, err
+    if stop_check and stop_check():
+        raise ProjectStopRequested('当前项目已收到停止请求')
     content = repair_prompt_dialogue_placement(content.strip(), shot)
     issues = validate_h3_production_prompt(
         content, dialogue_lines, len(refs_desc_lines))
@@ -2010,7 +2023,8 @@ def gen_shot_h3_prompt(shot, ref_paths=None, storyboard_ref_index=None, characte
     if issues:
         print(f"[H3提示词] 格式不合格，触发低温重编译: {issues}")
         content, repair_err = repair_h3_production_prompt(
-            sys_text, user_content, content, issues, dialogue_lines, len(refs_desc_lines))
+            sys_text, user_content, content, issues, dialogue_lines, len(refs_desc_lines),
+            stop_check=stop_check)
         if not content:
             return None, repair_err
     return content, None
@@ -2329,6 +2343,23 @@ def finalize_project_stopped(pid, run_id, message):
         proj['production_job'] = job
         save_project(proj, preserve_runtime=False)
         return copy.deepcopy(job)
+
+def finish_preproduction_llm_job(pid, run_id, status, message):
+    """Finish one synchronous preparation call without overwriting a pending stop."""
+    with _PROJECT_IO_LOCK:
+        proj = load_project(pid)
+        if not proj:
+            return None
+        job = proj.get('production_job') or {}
+        if job.get('run_id') != run_id:
+            return copy.deepcopy(job)
+        if status == 'stopped' or job.get('stop_requested'):
+            return finalize_project_stopped(
+                pid, run_id, message or '已停止，完成的结果已保留')
+        return update_production_job(
+            pid, run_id, status=status, message=message,
+            current_prompt_id=None, current_prompt_kind=None,
+            finished=time.time())
 
 def app_version():
     version_path = os.path.join(BASE_DIR, 'VERSION')
@@ -4096,6 +4127,20 @@ def preproduction_view(proj):
         item['progress'] = max(0, min(100, int(item.get('progress') or (100 if item.get('url') else 0))))
     return prep
 
+def finish_preproduction_llm_response(pid, run_id, payload, http_status, status, message):
+    job = finish_preproduction_llm_job(pid, run_id, status, message) or {}
+    if job.get('status') == 'stopped':
+        current = load_project(pid) or {'id': pid}
+        return jsonify({
+            'ok': True, 'stopped': True, 'status': 'stopped',
+            'msg': job.get('message') or message,
+            'production_job': job,
+            'preproduction': preproduction_view(current),
+        }), 200
+    response_payload = dict(payload)
+    response_payload['production_job'] = job
+    return jsonify(response_payload), http_status
+
 def prep_asset_batch_active(pid):
     with _PREP_ASSET_BATCH_LOCK:
         thread = _PREP_ASSET_BATCH_THREADS.get(pid)
@@ -4206,19 +4251,54 @@ def api_preproduction_outline(pid):
     proj = load_project(pid)
     if not proj or proj.get('input_mode') != 'story':
         return jsonify({'ok': False, 'msg': '项目不存在或入口模式不匹配'}), 404
-    ready, ready_err = prepare_llm_stage()
-    if not ready:
-        return jsonify({'ok': False, 'msg': f'Qwen服务准备失败：{ready_err}'}), 503
-    text, err = llm_chat([
-        {'role': 'system', 'content': PREP_OUTLINE_PROMPT},
-        {'role': 'user', 'content': proj.get('idea', '')}
-    ], max_tokens=1000, temperature=0.6)
-    if not text:
-        return jsonify({'ok': False, 'msg': f'大纲生成失败：{err}'}), 502
-    prep = prep_state(proj)
-    prep.update({'outline': text.strip(), 'outline_confirmed': False, 'step': 'outline_review'})
-    prep_touch(proj)
-    return jsonify({'ok': True, 'outline': text.strip(), 'preproduction': preproduction_view(proj)})
+    try:
+        run_id = begin_production_job(pid, 'preproduction_outline')
+    except ProjectAlreadyRunning as exc:
+        return jsonify({'ok': False, 'msg': str(exc)}), 409
+    try:
+        update_production_job(
+            pid, run_id, stage='preproduction', message='Qwen 正在生成剧情大纲')
+        raise_if_project_stopped(pid, run_id)
+        ready, ready_err = prepare_llm_stage()
+        if not ready:
+            return finish_preproduction_llm_response(
+                pid, run_id, {'ok': False, 'msg': f'Qwen服务准备失败：{ready_err}'},
+                503, 'failed', f'Qwen服务准备失败：{ready_err}')
+        raise_if_project_stopped(pid, run_id)
+        text, err = llm_chat([
+            {'role': 'system', 'content': PREP_OUTLINE_PROMPT},
+            {'role': 'user', 'content': proj.get('idea', '')}
+        ], max_tokens=1000, temperature=0.6,
+            stop_check=lambda: project_stop_requested(pid, run_id))
+        raise_if_project_stopped(pid, run_id)
+        if not text:
+            message = f'大纲生成失败：{err}'
+            return finish_preproduction_llm_response(
+                pid, run_id, {'ok': False, 'msg': message}, 502, 'failed', message)
+        with _PROJECT_IO_LOCK:
+            raise_if_project_stopped(pid, run_id)
+            proj = load_project(pid)
+            prep = prep_state(proj)
+            prep.update({'outline': text.strip(), 'outline_confirmed': False, 'step': 'outline_review'})
+            prep['updated'] = time.time()
+            job = set_production_job_status(
+                proj, 'done', '剧情大纲生成完成', finished=time.time(),
+                current_prompt_id=None, current_prompt_kind=None)
+            save_project(proj, preserve_runtime=False)
+        return jsonify({
+            'ok': True, 'outline': text.strip(),
+            'preproduction': preproduction_view(proj),
+            'production_job': job,
+        })
+    except ProjectStopRequested as exc:
+        message = str(exc) or '大纲生成已停止，原有内容已保留'
+        return finish_preproduction_llm_response(
+            pid, run_id, {'ok': True}, 200, 'stopped', message)
+    except Exception:
+        finish_preproduction_llm_job(pid, run_id, 'failed', '大纲生成异常结束，可重新生成')
+        raise
+    finally:
+        end_production_job(pid, run_id)
 
 @app.route('/api/preproduction/<pid>/outline/confirm', methods=['POST'])
 def api_preproduction_confirm_outline(pid):
@@ -4242,36 +4322,72 @@ def api_preproduction_script(pid):
     prep = prep_state(proj)
     if not prep.get('outline_confirmed'):
         return jsonify({'ok': False, 'msg': '请先确认剧情大纲'}), 409
-    ready, ready_err = prepare_llm_stage()
-    if not ready:
-        return jsonify({'ok': False, 'msg': f'Qwen服务准备失败：{ready_err}'}), 503
-    user_text = f"用户原始故事：\n{proj.get('idea', '')}\n\n已确认剧情大纲：\n{prep.get('outline', '')}"
-    content, err = llm_chat([
-        {'role': 'system', 'content': build_script_prompt(proj)},
-        {'role': 'user', 'content': user_text}
-    ], max_tokens=5000, temperature=0.65)
-    script = parse_json_from_text(content or '')
-    if not script or not script.get('shots'):
-        return jsonify({'ok': False, 'msg': f'剧本生成或解析失败：{err or "模型未返回有效 JSON"}'}), 502
-    for pos, segment in enumerate(script.get('shots', []), 1):
-        segment['index'] = pos
-        segment['segment_id'] = str(segment.get('segment_id') or f"EP01-{pos:02d}")
-        continuity_value = segment.get('continue_from_previous', False)
-        segment['continue_from_previous'] = pos > 1 and (
-            continuity_value is True or str(continuity_value).strip().lower() in ('1', 'true', 'yes', '是'))
-        try:
-            duration = int(segment.get('duration', 10))
-        except (TypeError, ValueError):
-            duration = 10
-        segment['duration'] = max(3, min(duration, 15))
-        segment['action'] = filter_slow_motion(segment.get('action', ''))
-        segment['camera'] = filter_slow_motion(segment.get('camera', ''))
-    proj['script'] = script
-    proj['prompts'] = {}
-    proj['title'] = script.get('title') or '未命名短剧'
-    prep.update({'script_confirmed': False, 'prompts_confirmed': False, 'step': 'script_review'})
-    prep_touch(proj)
-    return jsonify({'ok': True, 'script': script, 'preproduction': preproduction_view(proj)})
+    try:
+        run_id = begin_production_job(pid, 'preproduction_script')
+    except ProjectAlreadyRunning as exc:
+        return jsonify({'ok': False, 'msg': str(exc)}), 409
+    try:
+        update_production_job(
+            pid, run_id, stage='preproduction', message='Qwen 正在生成结构化剧本')
+        raise_if_project_stopped(pid, run_id)
+        ready, ready_err = prepare_llm_stage()
+        if not ready:
+            return finish_preproduction_llm_response(
+                pid, run_id, {'ok': False, 'msg': f'Qwen服务准备失败：{ready_err}'},
+                503, 'failed', f'Qwen服务准备失败：{ready_err}')
+        raise_if_project_stopped(pid, run_id)
+        user_text = f"用户原始故事：\n{proj.get('idea', '')}\n\n已确认剧情大纲：\n{prep.get('outline', '')}"
+        content, err = llm_chat([
+            {'role': 'system', 'content': build_script_prompt(proj)},
+            {'role': 'user', 'content': user_text}
+        ], max_tokens=5000, temperature=0.65,
+            stop_check=lambda: project_stop_requested(pid, run_id))
+        raise_if_project_stopped(pid, run_id)
+        script = parse_json_from_text(content or '')
+        if not script or not script.get('shots'):
+            message = f'剧本生成或解析失败：{err or "模型未返回有效 JSON"}'
+            return finish_preproduction_llm_response(
+                pid, run_id, {'ok': False, 'msg': message}, 502, 'failed', message)
+        for pos, segment in enumerate(script.get('shots', []), 1):
+            segment['index'] = pos
+            segment['segment_id'] = str(segment.get('segment_id') or f"EP01-{pos:02d}")
+            continuity_value = segment.get('continue_from_previous', False)
+            segment['continue_from_previous'] = pos > 1 and (
+                continuity_value is True or str(continuity_value).strip().lower() in ('1', 'true', 'yes', '是'))
+            try:
+                duration = int(segment.get('duration', 10))
+            except (TypeError, ValueError):
+                duration = 10
+            segment['duration'] = max(3, min(duration, 15))
+            segment['action'] = filter_slow_motion(segment.get('action', ''))
+            segment['camera'] = filter_slow_motion(segment.get('camera', ''))
+        with _PROJECT_IO_LOCK:
+            raise_if_project_stopped(pid, run_id)
+            proj = load_project(pid)
+            proj['script'] = script
+            proj['prompts'] = {}
+            proj['title'] = script.get('title') or '未命名短剧'
+            prep = prep_state(proj)
+            prep.update({'script_confirmed': False, 'prompts_confirmed': False, 'step': 'script_review'})
+            prep['updated'] = time.time()
+            job = set_production_job_status(
+                proj, 'done', '结构化剧本生成完成', finished=time.time(),
+                current_prompt_id=None, current_prompt_kind=None)
+            save_project(proj, preserve_runtime=False)
+        return jsonify({
+            'ok': True, 'script': script,
+            'preproduction': preproduction_view(proj),
+            'production_job': job,
+        })
+    except ProjectStopRequested as exc:
+        message = str(exc) or '剧本生成已停止，原有内容已保留'
+        return finish_preproduction_llm_response(
+            pid, run_id, {'ok': True}, 200, 'stopped', message)
+    except Exception:
+        finish_preproduction_llm_job(pid, run_id, 'failed', '剧本生成异常结束，可重新生成')
+        raise
+    finally:
+        end_production_job(pid, run_id)
 
 @app.route('/api/preproduction/<pid>/script/confirm', methods=['POST'])
 def api_preproduction_confirm_script(pid):
@@ -4318,45 +4434,94 @@ def api_preproduction_prompts(pid):
         return jsonify({'ok': False, 'msg': '请先确认剧本'}), 409
     if normalize_script_dialogue(proj.get('script')):
         save_project(proj)
-    ready, ready_err = prepare_llm_stage()
-    if not ready:
-        return jsonify({'ok': False, 'msg': f'Qwen服务准备失败：{ready_err}'}), 503
-    prompts = dict(proj.get('prompts') or {})
-    prompt_errors = []
-    profile_map = character_profiles_by_name(proj.get('script'))
-    for pos, shot in enumerate(proj['script'].get('shots', []), 1):
-        idx = int(shot.get('index') or pos)
-        cached = prompts.get(str(idx))
-        if cached and not validate_h3_production_prompt(cached, shot_dialogue_lines(shot), 9):
-            continue
-        # Assets are intentionally generated after prompt review. Compile against the confirmed
-        # text contract now; the complete ordered image set is attached only at H3 render time.
-        text, err = gen_shot_h3_prompt(shot, [], None, profile_map)
-        if not text:
-            prompt_errors.append(f'{segment_label(shot, idx)}：{err or "提示词生成失败"}')
-            continue
-        prompts[str(idx)] = apply_character_visual_locks(
-            filter_slow_motion(text), shot, profile_map)
-        proj['prompts'] = prompts
-        proj['prompt_format_version'] = H3_PROMPT_FORMAT_VERSION
-        save_project(proj)
-    if exclusive_on():
-        stop_local_llm()
-    prep = prep_state(proj)
-    if prompt_errors:
-        prep.update({'prompts_confirmed': False, 'step': 'prompts'})
-        prep_touch(proj)
+    try:
+        run_id = begin_production_job(pid, 'preproduction_prompts')
+    except ProjectAlreadyRunning as exc:
+        return jsonify({'ok': False, 'msg': str(exc)}), 409
+    llm_prepared = False
+    try:
+        update_production_job(
+            pid, run_id, stage='preproduction', message='Qwen 正在逐片生成 H3 提示词')
+        raise_if_project_stopped(pid, run_id)
+        ready, ready_err = prepare_llm_stage()
+        if not ready:
+            return finish_preproduction_llm_response(
+                pid, run_id, {'ok': False, 'msg': f'Qwen服务准备失败：{ready_err}'},
+                503, 'failed', f'Qwen服务准备失败：{ready_err}')
+        llm_prepared = True
+        raise_if_project_stopped(pid, run_id)
+        proj = load_project(pid)
+        prompts = dict(proj.get('prompts') or {})
+        prompt_errors = []
+        profile_map = character_profiles_by_name(proj.get('script'))
+        for pos, shot in enumerate(proj['script'].get('shots', []), 1):
+            raise_if_project_stopped(pid, run_id)
+            idx = int(shot.get('index') or pos)
+            cached = prompts.get(str(idx))
+            if cached and not validate_h3_production_prompt(cached, shot_dialogue_lines(shot), 9):
+                continue
+            update_production_job(
+                pid, run_id, message=f'Qwen 正在生成 {segment_label(shot, idx)} 提示词')
+            # Assets are intentionally generated after prompt review. Compile against the confirmed
+            # text contract now; the complete ordered image set is attached only at H3 render time.
+            text, err = gen_shot_h3_prompt(
+                shot, [], None, profile_map,
+                stop_check=lambda: project_stop_requested(pid, run_id))
+            raise_if_project_stopped(pid, run_id)
+            if not text:
+                prompt_errors.append(f'{segment_label(shot, idx)}：{err or "提示词生成失败"}')
+                continue
+            generated_prompt = apply_character_visual_locks(
+                filter_slow_motion(text), shot, profile_map)
+            with _PROJECT_IO_LOCK:
+                raise_if_project_stopped(pid, run_id)
+                proj = load_project(pid)
+                prompts = dict(proj.get('prompts') or {})
+                prompts[str(idx)] = generated_prompt
+                proj['prompts'] = prompts
+                proj['prompt_format_version'] = H3_PROMPT_FORMAT_VERSION
+                save_project(proj)
+        with _PROJECT_IO_LOCK:
+            raise_if_project_stopped(pid, run_id)
+            proj = load_project(pid)
+            prompts = dict(proj.get('prompts') or {})
+            prep = prep_state(proj)
+            if prompt_errors:
+                prep.update({'prompts_confirmed': False, 'step': 'prompts'})
+            else:
+                proj['prompt_format_version'] = H3_PROMPT_FORMAT_VERSION
+                prep.update({'prompts_confirmed': False, 'step': 'prompts_review'})
+            prep['updated'] = time.time()
+            message = ((f'{len(prompt_errors)}个片段提示词未通过，其余已保存，可再次点击只补失败项：'
+                        + '；'.join(prompt_errors[:5])) if prompt_errors else 'H3 提示词生成完成')
+            job = set_production_job_status(
+                proj, 'failed' if prompt_errors else 'done', message,
+                finished=time.time(), current_prompt_id=None, current_prompt_kind=None)
+            save_project(proj, preserve_runtime=False)
+        if prompt_errors:
+            return jsonify({
+                'ok': False, 'msg': message, 'prompts': prompts,
+                'preproduction': preproduction_view(proj),
+                'production_job': job,
+            }), 502
         return jsonify({
-            'ok': False,
-            'msg': f'{len(prompt_errors)}个片段提示词未通过，其余已保存，可再次点击只补失败项：' + '；'.join(prompt_errors[:5]),
-            'prompts': prompts,
+            'ok': True, 'prompts': prompts,
             'preproduction': preproduction_view(proj),
-        }), 502
-    proj['prompts'] = prompts
-    proj['prompt_format_version'] = H3_PROMPT_FORMAT_VERSION
-    prep.update({'prompts_confirmed': False, 'step': 'prompts_review'})
-    prep_touch(proj)
-    return jsonify({'ok': True, 'prompts': prompts, 'preproduction': preproduction_view(proj)})
+            'production_job': job,
+        })
+    except ProjectStopRequested as exc:
+        message = str(exc) or '提示词生成已停止，已完成的提示词已保留'
+        return finish_preproduction_llm_response(
+            pid, run_id, {'ok': True}, 200, 'stopped', message)
+    except Exception:
+        finish_preproduction_llm_job(pid, run_id, 'failed', '提示词生成异常结束，可重新生成')
+        raise
+    finally:
+        try:
+            if llm_prepared and exclusive_on():
+                stop_local_llm()
+        finally:
+            end_production_job(pid, run_id)
 
 @app.route('/api/preproduction/<pid>/prompts/confirm', methods=['POST'])
 def api_preproduction_confirm_prompts(pid):

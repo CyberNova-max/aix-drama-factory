@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import copy
+import json
 import os
 import sys
 import tempfile
@@ -55,6 +56,33 @@ class PipelineStopTests(unittest.TestCase):
         }
         factory.save_project(project)
         return project
+
+    def save_preproduction(self, pid='prep-1', outline_confirmed=False,
+                           script_confirmed=False, script=None, prompts=None):
+        project = {
+            'id': pid, 'idea': '测试故事', 'input_mode': 'story', 'title': '测试项目',
+            'style': '电影写实', 'assets': {}, 'shots': [], 'final': None,
+            'script': script, 'prompts': prompts or {}, 'created': time.time(),
+            'preproduction': {
+                'version': 2, 'step': 'prompts' if script_confirmed else 'outline',
+                'story_confirmed': True, 'outline': '已保存的大纲',
+                'outline_confirmed': outline_confirmed,
+                'script_confirmed': script_confirmed,
+                'prompts_confirmed': False, 'asset_plan': [],
+                'assets_confirmed': False,
+                'asset_batch': {'status': 'waiting', 'total': 0, 'completed': 0, 'failed': 0},
+                'updated': time.time(),
+            },
+        }
+        factory.save_project(project)
+        return project
+
+    def stop_current_preproduction_job(self, pid):
+        job = factory.load_project(pid)['production_job']
+        response = factory.app.test_client().post(
+            f'/api/project/{pid}/stop', json={'run_id': job['run_id']})
+        self.assertEqual(response.status_code, 202)
+        return job['run_id']
 
     @patch.object(factory.requests, 'get')
     @patch.object(factory.requests, 'post')
@@ -312,6 +340,137 @@ class PipelineStopTests(unittest.TestCase):
                 factory.begin_production_job('project-1', 'pipeline')
         finally:
             factory.end_production_job('project-1', run_id)
+
+    @patch.object(factory, 'prepare_llm_stage', return_value=(True, None))
+    @patch.object(factory, 'llm_chat')
+    def test_outline_stop_survives_refresh_and_allows_regeneration(self, llm_chat, _prepare):
+        self.save_preproduction()
+        observed = {}
+
+        def stop_during_outline(*_args, **_kwargs):
+            observed['first_run_id'] = self.stop_current_preproduction_job('prep-1')
+            refreshed = factory.app.test_client().get('/api/project/prep-1').get_json()['project']
+            observed['refresh_status'] = refreshed['production_job']['status']
+            return '不应保存的新大纲', None
+
+        llm_chat.side_effect = stop_during_outline
+        stopped = self.client.post('/api/preproduction/prep-1/outline/generate')
+
+        self.assertEqual(stopped.status_code, 200)
+        self.assertTrue(stopped.get_json()['stopped'])
+        self.assertEqual(observed['refresh_status'], 'stopping')
+        saved = factory.load_project('prep-1')
+        self.assertEqual(saved['production_job']['status'], 'stopped')
+        self.assertEqual(saved['preproduction']['outline'], '已保存的大纲')
+        self.assertFalse(factory.project_job_active('prep-1'))
+
+        llm_chat.side_effect = None
+        llm_chat.return_value = ('重新生成成功的大纲', None)
+        regenerated = self.client.post('/api/preproduction/prep-1/outline/generate')
+
+        self.assertEqual(regenerated.status_code, 200)
+        self.assertFalse(regenerated.get_json().get('stopped', False))
+        saved = factory.load_project('prep-1')
+        self.assertEqual(saved['production_job']['status'], 'done')
+        self.assertNotEqual(saved['production_job']['run_id'], observed['first_run_id'])
+        self.assertEqual(saved['preproduction']['outline'], '重新生成成功的大纲')
+
+    @patch.object(factory, 'prepare_llm_stage', return_value=(True, None))
+    @patch.object(factory, 'llm_chat')
+    def test_script_generation_can_be_stopped_without_replacing_saved_script(self, llm_chat, _prepare):
+        old_script = {'title': '旧剧本', 'shots': [{'index': 1, 'action': '旧动作'}]}
+        self.save_preproduction(outline_confirmed=True, script=old_script)
+        generated = {
+            'title': '新剧本',
+            'characters': [], 'scenes': [], 'props': [],
+            'shots': [{'index': 1, 'duration': 8, 'action': '新动作', 'camera': '近景'}],
+        }
+
+        def stop_during_script(*_args, **_kwargs):
+            self.stop_current_preproduction_job('prep-1')
+            return json.dumps(generated, ensure_ascii=False), None
+
+        llm_chat.side_effect = stop_during_script
+        response = self.client.post('/api/preproduction/prep-1/script/generate')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()['stopped'])
+        saved = factory.load_project('prep-1')
+        self.assertEqual(saved['production_job']['status'], 'stopped')
+        self.assertEqual(saved['script'], old_script)
+
+    @patch.object(factory, 'prepare_llm_stage', return_value=(True, None))
+    @patch.object(factory, 'gen_shot_h3_prompt')
+    def test_prompt_batch_stop_preserves_only_completed_prompts(self, generate_prompt, _prepare):
+        script = {
+            'title': '两片短剧', 'characters': [], 'scenes': [], 'props': [],
+            'shots': [
+                {'index': 1, 'segment_id': 'EP01-01', 'duration': 8,
+                 'characters': [], 'props': [], 'scene': '', 'action': '动作一', 'camera': '近景'},
+                {'index': 2, 'segment_id': 'EP01-02', 'duration': 8,
+                 'characters': [], 'props': [], 'scene': '', 'action': '动作二', 'camera': '远景'},
+            ],
+        }
+        self.save_preproduction(
+            outline_confirmed=True, script_confirmed=True, script=script)
+
+        def generate_then_stop(shot, *_args, **_kwargs):
+            if shot['index'] == 1:
+                return '已完成的第一片提示词', None
+            self.stop_current_preproduction_job('prep-1')
+            return '停止后返回的第二片提示词', None
+
+        generate_prompt.side_effect = generate_then_stop
+        response = self.client.post('/api/preproduction/prep-1/prompts/generate')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()['stopped'])
+        saved = factory.load_project('prep-1')
+        self.assertEqual(saved['production_job']['status'], 'stopped')
+        self.assertEqual(saved['prompts'], {'1': '已完成的第一片提示词'})
+        self.assertEqual(saved['preproduction']['step'], 'prompts')
+
+    @patch.object(factory.time, 'sleep')
+    @patch.object(factory, 'ensure_local_llm')
+    @patch.object(factory, 'get_llm_endpoint', return_value=('http://llm.test', 'EMPTY', 'test-model'))
+    @patch.object(factory.requests, 'post')
+    def test_llm_stop_after_failed_request_prevents_recovery_and_retry(
+            self, post, _endpoint, recover, sleep):
+        stopped = {'value': False}
+
+        def fail_once(*_args, **_kwargs):
+            stopped['value'] = True
+            raise factory.requests.exceptions.ConnectionError('offline')
+
+        post.side_effect = fail_once
+        with self.assertRaises(factory.ProjectStopRequested):
+            factory.llm_chat(
+                [{'role': 'user', 'content': 'test'}], retries=3,
+                stop_check=lambda: stopped['value'])
+
+        self.assertEqual(post.call_count, 1)
+        recover.assert_not_called()
+        sleep.assert_not_called()
+
+    @patch.object(factory, 'llm_chat')
+    def test_prompt_stop_after_first_draft_skips_repair_request(self, llm_chat):
+        stopped = {'value': False}
+        shot = {
+            'index': 1, 'segment_id': 'EP01-01', 'duration': 8,
+            'characters': [], 'props': [], 'scene': '',
+            'action': '测试动作', 'camera': '近景',
+        }
+
+        def return_draft(*_args, **_kwargs):
+            stopped['value'] = True
+            return '需要修复的首稿', None
+
+        llm_chat.side_effect = return_draft
+        with self.assertRaises(factory.ProjectStopRequested):
+            factory.gen_shot_h3_prompt(
+                shot, stop_check=lambda: stopped['value'])
+
+        self.assertEqual(llm_chat.call_count, 1)
 
 
 if __name__ == '__main__':

@@ -218,6 +218,7 @@
       <button id="btn-stop-prep" onclick="requestStopCurrentProject()" class="hidden min-h-11 text-xs px-3 py-2 rounded-lg border border-red-400/30 text-red-200 hover:bg-red-400/10">■ 停止当前任务</button>
       <button onclick="refreshPreproduction()" class="text-xs px-3 py-2 rounded-lg glass hover:bg-white/10">↻ 刷新状态</button>
     </div>
+    <div id="prep-job-status" class="hidden mb-4 rounded-xl border px-4 py-3 text-sm"></div>
     <div id="prep-steps" class="grid grid-cols-2 md:grid-cols-6 gap-2 mb-5"></div>
     <div id="prep-content"></div>
   </section>
@@ -452,6 +453,7 @@ const STAGES=[{n:1,name:'剧本解析',icon:'📝'},{n:2,name:'资产生成',ico
 const STAGE_RANGE={1:[0,15],2:[15,40],3:[40,95],4:[95,100]};
 let currentPid=null, es=null, SHOT_DATA={}, pipelineStartedAt=0, progressTimer=null, pipelineEnded=false, pipelineShotTotal=0, projectPollTimer=null, polledAssets={}, polledShots={}, lastProductionErrorToken='';
 let currentProductionJob=null, stopRequestInFlight=false;
+const LAST_PROJECT_KEY='aix-current-project';
 let mainInputMode=localStorage.getItem('main_h3_input_mode')==='h3_prompt'?'h3_prompt':'story';
 let showH3Prompts=localStorage.getItem('h3_show_prompts')==='1';
 let guidedFlow=localStorage.getItem('guided_preproduction')!=='0', currentPrepProject=null, panelInitialized=false;
@@ -462,6 +464,15 @@ let portalLinks={
 };
 
 function $(id){return document.getElementById(id);}
+function selectCurrentProject(pid){
+  currentPid=pid||null;
+  try{if(currentPid)localStorage.setItem(LAST_PROJECT_KEY,currentPid);else localStorage.removeItem(LAST_PROJECT_KEY);}catch(e){}
+}
+async function restoreLastProject(){
+  let pid='';try{pid=localStorage.getItem(LAST_PROJECT_KEY)||'';}catch(e){}
+  if(!pid)return;
+  try{if(!await openProject(pid))localStorage.removeItem(LAST_PROJECT_KEY);}catch(e){try{localStorage.removeItem(LAST_PROJECT_KEY);}catch(_err){}}
+}
 function validPortalUrl(value){
   try{const url=new URL(String(value||''));return ['http:','https:'].includes(url.protocol)?url.href:'';}catch(e){return '';}
 }
@@ -535,6 +546,13 @@ function renderProductionJobState(job,project={}){
   if(status==='stopped'){
     stopProgressClock();setProductionProgress(parseInt($('progress-percent').textContent)||0,'已停止',job?.message||'已完成结果已保留，可从断点继续');
   }
+  const prepLlmJob=job?.stage==='preproduction',prepActive=prepLlmJob&&(stoppable||stopping),prepStatus=$('prep-job-status');
+  if(prepStatus){
+    const visible=prepLlmJob&&['queued','running','retrying','stopping','stopped','failed'].includes(status);
+    prepStatus.className=`${visible?'':'hidden ' }mb-4 rounded-xl border px-4 py-3 text-sm ${status==='failed'?'border-red-400/30 bg-red-400/5 text-red-200':'border-yellow-400/30 bg-yellow-400/5 gold'}`;
+    prepStatus.textContent=stopping?'⏳ 正在停止；已完成结果会保留':status==='stopped'?`■ 已停止；${job?.message||'可以重新生成'}`:status==='failed'?`生成失败：${job?.message||'可以重新生成'}`:(job?.message||'生成任务正在运行');
+  }
+  document.querySelectorAll('#prep-content button').forEach(button=>{if(prepLlmJob)button.disabled=prepActive;});
 }
 async function requestStopCurrentProject(){
   if(!currentPid||stopRequestInFlight)return;
@@ -749,7 +767,7 @@ async function startPreproduction(){
       shot_count:mainInputMode==='h3_prompt'?'auto':$('shotCount').value,
       custom_assets:$('customAssets').checked,
       generate_storyboards:$('generateStoryboards').checked});
-    currentPid=d.pid;await refreshPreproduction();
+    selectCurrentProject(d.pid);await refreshPreproduction();
     $('prep-box').scrollIntoView({behavior:'smooth',block:'start'});
     log(`已创建分阶段筹备项目 ${d.pid}`,'text-green-400');
   }catch(e){alert('创建失败：'+e.message);}
@@ -836,11 +854,11 @@ async function prepStartAssetBatch(auto=false){
   catch(e){if(!auto)alert('批量生成启动失败：'+e.message);else console.error(e);}
   finally{prepAssetStarting=false;}
 }
-async function prepGenerateOutline(){try{setPrepBusy('Qwen 正在生成剧情大纲…');await prepRequest(`/api/preproduction/${currentPid}/outline/generate`);await refreshPreproduction();}catch(e){alert(e.message);setPrepBusy('');}}
+async function prepGenerateOutline(){try{setPrepBusy('Qwen 正在生成剧情大纲…');startProjectPolling(currentPid,false);await prepRequest(`/api/preproduction/${currentPid}/outline/generate`);await refreshPreproduction();}catch(e){alert(e.message);setPrepBusy('');}}
 async function prepConfirmOutline(){try{setPrepBusy('正在保存大纲…');await prepRequest(`/api/preproduction/${currentPid}/outline/confirm`,{outline:$('prep-outline').value});await refreshPreproduction();}catch(e){alert(e.message);setPrepBusy('');}}
-async function prepGenerateScript(){try{setPrepBusy('Qwen 正在根据已确认大纲生成结构化剧本…');await prepRequest(`/api/preproduction/${currentPid}/script/generate`);await refreshPreproduction();}catch(e){alert(e.message);setPrepBusy('');}}
+async function prepGenerateScript(){try{setPrepBusy('Qwen 正在根据已确认大纲生成结构化剧本…');startProjectPolling(currentPid,false);await prepRequest(`/api/preproduction/${currentPid}/script/generate`);await refreshPreproduction();}catch(e){alert(e.message);setPrepBusy('');}}
 async function prepConfirmScript(){try{const script=JSON.parse($('prep-script').value);setPrepBusy('正在保存剧本…');await prepRequest(`/api/preproduction/${currentPid}/script/confirm`,{script});await refreshPreproduction();}catch(e){alert('剧本确认失败：'+e.message);setPrepBusy('');}}
-async function prepGeneratePrompts(){try{setPrepBusy('Qwen 正在逐片编排 H3 提示词（每片内含多个镜头），请稍候…');await prepRequest(`/api/preproduction/${currentPid}/prompts/generate`);await refreshPreproduction();}catch(e){alert(e.message);setPrepBusy('');}}
+async function prepGeneratePrompts(){try{setPrepBusy('Qwen 正在逐片编排 H3 提示词（每片内含多个镜头），请稍候…');startProjectPolling(currentPid,false);await prepRequest(`/api/preproduction/${currentPid}/prompts/generate`);await refreshPreproduction();}catch(e){alert(e.message);setPrepBusy('');}}
 async function prepConfirmPrompts(){try{const prompts={};document.querySelectorAll('[data-prep-prompt]').forEach(x=>prompts[x.dataset.prepPrompt]=x.value.trim());setPrepBusy(currentPrepProject?.generate_storyboards===false?'正在建立人物、场景和道具资产清单…':'正在建立资产与片段构图参考清单…');await prepRequest(`/api/preproduction/${currentPid}/prompts/confirm`,{prompts});await refreshPreproduction();}catch(e){alert(e.message);setPrepBusy('');}}
 async function prepConfirmDirectPrompt(){try{setPrepBusy('Qwen 只调用一次：正在识别片段资产与跨片连续性…');await prepRequest(`/api/preproduction/${currentPid}/prompts/confirm`,{source_prompt:$('prep-source-prompt').value});await refreshPreproduction();}catch(e){alert(e.message);setPrepBusy('');}}
 async function prepGenerateAsset(i){const item=currentPrepProject?.preproduction?.asset_plan?.[i];if(!item)return;const prompt=document.querySelector(`[data-asset-prompt="${i}"]`).value.trim();try{setPrepBusy(`已提交「${item.name}」，正在显示采样进度…`);await prepRequest(`/api/preproduction/${currentPid}/asset/generate`,{key:item.key,prompt});await refreshPreproduction();}catch(e){alert('生成失败：'+e.message);setPrepBusy('');}}
@@ -892,7 +910,7 @@ function runPipeline(continuePid){
   const steps=Math.max(4,Math.min(25,parseInt($('h3Steps').value)||10));$('h3Steps').value=steps;
   const url=`/api/pipeline/run?idea=${encodeURIComponent(idea)}&input_mode=${mainInputMode}&style=${encodeURIComponent(style)}&scene_reference_mode=${$('sceneRefMode').value}&shot_duration=${dur}&shot_count=${cnt}&aspect_ratio=${encodeURIComponent(asp)}&megapixels=${mp}&h3_steps=${steps}&h3_model_profile=${$('h3Model').value}&custom_assets=${$('customAssets').checked?1:0}${continuePid?`&pid=${continuePid}`:''}`;
   es=new EventSource(url);
-  es.addEventListener('start',e=>{const d=JSON.parse(e.data);currentPid=d.pid;log(`项目创建: ${d.pid}`,'gold');setProductionProgress(1,'项目已创建',d.pid);});
+  es.addEventListener('start',e=>{const d=JSON.parse(e.data);selectCurrentProject(d.pid);log(`项目创建: ${d.pid}`,'gold');setProductionProgress(1,'项目已创建',d.pid);});
   es.addEventListener('job_status',e=>{const d=JSON.parse(e.data);currentProductionJob={...(currentProductionJob||{}),...d};renderProductionJobState(currentProductionJob,currentPrepProject||{});if(['stopped','done','failed'].includes(d.status))startProjectPolling(currentPid);});
   es.addEventListener('stage',e=>{
     const d=JSON.parse(e.data);
@@ -1188,9 +1206,9 @@ async function deleteProject(pid){
 }
 async function openProject(pid){
   const r=await(await fetch('/api/project/'+pid)).json();
-  if(!r.ok)return;
+  if(!r.ok)return false;
   const p=r.project;$('proj-modal').classList.replace('flex','hidden');
-  currentPid=pid;polledAssets={};polledShots={};SHOT_DATA={};lastProductionErrorToken='';renderStages();$('pipeline-box').classList.remove('hidden');$('final-box').classList.add('hidden');$('final-video').removeAttribute('src');$('proj-title').textContent=`${p.title||'未命名'} · ${pid.slice(0,6)}`;
+  selectCurrentProject(pid);polledAssets={};polledShots={};SHOT_DATA={};lastProductionErrorToken='';renderStages();$('pipeline-box').classList.remove('hidden');$('final-box').classList.add('hidden');$('final-video').removeAttribute('src');$('proj-title').textContent=`${p.title||'未命名'} · ${pid.slice(0,6)}`;
   currentProductionJob=p.production_job||null;renderProductionJobState(currentProductionJob,p);
   setMainInputMode(p.input_mode==='h3_prompt'?'h3_prompt':'story');
   $('idea').value=p.input_mode==='h3_prompt'?(p.manual_h3_prompt||p.idea||''):(p.idea||'');
@@ -1199,7 +1217,7 @@ async function openProject(pid){
   if(p.preproduction&&!hasProductionHistory){
     currentPrepProject=p;renderPreproduction(p);$('pipeline-box').classList.add('hidden');
     log(`已恢复前期筹备项目《${p.title||pid}》`,'gold');
-    startProjectPolling(pid);$('prep-box').scrollIntoView({behavior:'smooth',block:'start'});return;
+    startProjectPolling(pid);$('prep-box').scrollIntoView({behavior:'smooth',block:'start'});return true;
   }
   $('prep-box').classList.add('hidden');currentPrepProject=p;
   $('char-list').innerHTML='';$('scene-list').innerHTML='';$('prop-list').innerHTML='';$('shot-grid').innerHTML='';
@@ -1213,11 +1231,12 @@ async function openProject(pid){
   if(waitingAssets){setProductionProgress(15,'等待参考图确认','上传所需图片后点击继续生成');log('该项目处于自定义参考图待确认状态，可继续上传后点「继续生成」','gold');showAssetUploadUI();}
   log(`已载入项目《${p.title||pid}》`,'gold');
   startProjectPolling(pid);
+  return true;
 }
 
-function startProjectPolling(pid){
+function startProjectPolling(pid,immediate=true){
   if(projectPollTimer)clearInterval(projectPollTimer);
-  pollProjectSnapshot(pid);
+  if(immediate)pollProjectSnapshot(pid);
   projectPollTimer=setInterval(()=>pollProjectSnapshot(pid),5000);
 }
 async function pollProjectSnapshot(pid){
@@ -1412,7 +1431,7 @@ $('h3Steps').addEventListener('change',syncMainConfig);
 $('h3Model').addEventListener('change',()=>{if(panelInitialized)setH3ModelProfile($('h3Model').value,'main');});
 $('sceneRefMode').addEventListener('change',syncMainConfig);
 
-applyTheme(document.documentElement.dataset.theme||'dark',false);loadPortalLinks();renderStages();refreshStatus();initPanel();setMainInputMode(mainInputMode);setShowPrompts(showH3Prompts);setGuidedFlow(guidedFlow);setInterval(refreshStatus,15000);
+applyTheme(document.documentElement.dataset.theme||'dark',false);loadPortalLinks();renderStages();refreshStatus();initPanel();setMainInputMode(mainInputMode);setShowPrompts(showH3Prompts);setGuidedFlow(guidedFlow);restoreLastProject();setInterval(refreshStatus,15000);
 </script>
 </body>
 </html>
