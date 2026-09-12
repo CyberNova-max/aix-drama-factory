@@ -20,7 +20,8 @@ if not errorlevel 1 goto :stable_busy
 netstat -ano -p tcp | findstr /R /C:"127.0.0.1:8084 .*LISTENING" >nul
 if not errorlevel 1 goto :stable_busy
 
-curl -s -m 3 http://127.0.0.1:%AIX_WEB_PORT%/ >nul 2>&1
+REM Match the local endpoint for any IPv4 or IPv6 TCP listener.
+netstat -ano -p tcp | findstr /R /C:":%AIX_WEB_PORT% .*LISTENING" >nul
 if not errorlevel 1 (
     echo [BLOCKED] Development web port %AIX_WEB_PORT% is already in use.
     echo           Close the service on that port, then run start-dev.bat again.
