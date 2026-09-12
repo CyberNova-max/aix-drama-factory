@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.0.0-dev.10 - 2026-09-12
+
+- Added a per-segment retry action when an H3 video segment fails.
+- Retrying regenerates only the selected failed segment and preserves completed segments.
+- Added persisted production and retry states that recover after page refresh or service restart.
+- Added per-project locking to prevent duplicate full-pipeline and segment-retry jobs.
+- Kept successfully generated segments available when final FFmpeg composition fails.
+- Added regression coverage for retry isolation, interrupted-state recovery, duplicate-job protection, and finalization failures.
+
 ## 2.0.0-dev.9 - 2026-09-12
 
 - Established the standalone AIX Drama Factory V2 open-source repository with a clean, independent history.

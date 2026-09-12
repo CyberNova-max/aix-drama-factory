@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-`v2.0.0-dev.9` is a development preview. Security fixes are applied to the newest development release only.
+`v2.0.0-dev.10` is a development preview. Security fixes are applied to the newest development release only.
 
 ## Reporting a vulnerability
 
