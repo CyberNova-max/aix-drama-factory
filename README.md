@@ -47,6 +47,8 @@ AIX 短剧工厂是面向本地 AI 视频生产的 Web 工作台，把故事/剧
 4. 如需扩展模型目录，复制 `extra_model_paths.example.yaml` 为 `extra_model_paths.yaml`。
 5. Windows 上双击 `start-web.bat`，或运行 `python app.py`，然后打开 `http://127.0.0.1:7861`。
 
+正式 Web 默认使用 7861。需要与正式实例并行开发时请运行 `start-dev.bat`，开发 Web 固定使用本机 7862；端口已被占用时启动器会阻止启动，避免误连其他实例。
+
 只使用完整 H3 提示词入口时可不安装 Qwen 文案模型；自动故事、剧本和提示词功能需要 OpenAI 兼容 LLM。更详细的开发目录规则见 [DEV-README.md](DEV-README.md)，三模块发布方式见 [DISTRIBUTION.md](DISTRIBUTION.md)。
 
 ## 从 dev.9 更新

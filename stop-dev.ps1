@@ -5,7 +5,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $devRoot 'app.py'))) {
 }
 
 $rules = @{
-    7861 = 'app\.py'
+    7862 = 'app\.py'
     8190 = 'ComfyUI\\main\.py'
     8085 = 'llama-server\.exe'
 }
