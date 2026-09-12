@@ -2,11 +2,15 @@
 
 AIX 短剧工厂是面向本地 AI 视频生产的 Web 工作台，把故事/剧本、角色与场景资产、MiniMax H3 提示词、ComfyUI 生成、断点恢复和成片整理放在同一套流程中。
 
-**当前版本：`v2.0.0-dev.9`（开发预览）**
+**当前版本：`v2.0.0-dev.10`（开发预览）**
 
 本开源仓库从 AIX V2 开始建立独立历史，不包含私人客户项目的源码、分支、标签、发布记录或客户资料。
 
-## v2.0.0-dev.9 重点
+## v2.0.0-dev.10 重点
+
+- 视频片段生成失败后可单独重新生成，不必重做已经成功的片段。
+- 生成状态可在页面刷新或服务重启后恢复，并防止同一项目重复启动生成任务。
+- 片段生成成功但最终合成失败时，保留成功片段并允许从断点继续。
 
 - 通用 V2 分阶段生产：故事、大纲、剧本、资产、H3 提示词、图片/视频和成片整理。
 - 同时支持 `managed` 托管模式和 `external` 外部服务模式；外部模式不会启停用户已有的 ComfyUI/Qwen。
@@ -45,13 +49,13 @@ AIX 短剧工厂是面向本地 AI 视频生产的 Web 工作台，把故事/剧
 
 只使用完整 H3 提示词入口时可不安装 Qwen 文案模型；自动故事、剧本和提示词功能需要 OpenAI 兼容 LLM。更详细的开发目录规则见 [DEV-README.md](DEV-README.md)，三模块发布方式见 [DISTRIBUTION.md](DISTRIBUTION.md)。
 
-## 从 dev.8 更新
+## 从 dev.9 更新
 
-GitHub Release 附件 `AIX-DramaFactory-V2-2.0.0-dev.9-update.zip` 面向已安装 V2 Web 的 Windows 用户，不包含模型、ComfyUI、Qwen、项目、素材或成片。下载后先用同名 `.sha256.txt` 校验，关闭 AIX Web 后再按包内说明更新。
+GitHub Release 附件 `AIX-DramaFactory-V2-2.0.0-dev.10-update.zip` 面向已安装 `v2.0.0-dev.9` 的 V2 Web Windows 用户，不包含模型、ComfyUI、Qwen、项目、素材或成片。下载后先用同名 `.sha256.txt` 校验，关闭 AIX Web 后再按包内说明更新。
 
 ## 参与贡献
 
-AIX 短剧工厂欢迎社区共同开发。当前项目处于快速开发阶段，统一开发预览版为 `v2.0.0-dev.9`。
+AIX 短剧工厂欢迎社区共同开发。当前项目处于快速开发阶段，统一开发预览版为 `v2.0.0-dev.10`。
 
 ```text
 Fork / Clone
