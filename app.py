@@ -126,6 +126,66 @@ def enforce_desktop_safe_mode():
 _PREP_ASSET_MANUAL_THREADS = {}
 _PREP_ASSET_STATE_LOCK = threading.RLock()
 _PROJECT_IO_LOCK = threading.RLock()
+_PROJECT_JOB_LOCK = threading.RLock()
+_PROJECT_JOB_HANDLES = {}
+ACTIVE_PRODUCTION_STATUSES = {'running', 'retrying', 'merging'}
+
+def _lock_project_job_file(pid):
+    """Acquire a non-blocking per-project OS lock shared by local/cloud workers."""
+    handle = None
+    try:
+        path = f"{project_path(pid)}.run.lock"
+        handle = open(path, 'a+b')
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b'0')
+            handle.flush()
+        handle.seek(0)
+        if os.name == 'nt':
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        print(f"[项目锁] {pid} 获取失败: {exc}")
+        return None
+    return handle
+
+def claim_project_job(pid, job_id):
+    """Claim the only production slot for a project, including across worker processes."""
+    with _PROJECT_JOB_LOCK:
+        if pid in _PROJECT_JOB_HANDLES:
+            return False
+        handle = _lock_project_job_file(pid)
+        if handle is None:
+            return False
+        _PROJECT_JOB_HANDLES[pid] = (job_id, handle)
+        return True
+
+def release_project_job(pid, job_id=None):
+    with _PROJECT_JOB_LOCK:
+        current = _PROJECT_JOB_HANDLES.get(pid)
+        if not current or (job_id is not None and current[0] != job_id):
+            return
+        _PROJECT_JOB_HANDLES.pop(pid, None)
+        current[1].close()
+
+def project_job_active(pid):
+    """Probe the cross-process lock without trusting this worker's memory."""
+    with _PROJECT_JOB_LOCK:
+        if pid in _PROJECT_JOB_HANDLES:
+            return True
+        handle = _lock_project_job_file(pid)
+        if handle is None:
+            return True
+        handle.close()
+        return False
 
 def resolve_runtime_path(value, fallback=None):
     """Resolve configured runtime paths. Relative paths are based on the AIX app directory."""
@@ -2026,6 +2086,7 @@ def desktop_project_detail(proj):
         'shots': shots_view,
         'final_url': proj.get('final'),
         'item_states': proj.get('item_states', {}),
+        'production_job': proj.get('production_job', {}),
         'preproduction': desktop_preproduction_view(proj) if proj.get('preproduction') else None,
         'prompts': proj.get('prompts', {}),
     }
@@ -2060,6 +2121,10 @@ def set_item_state(proj, group, key, status, progress=0, message='', kind=None, 
         state['kind'] = kind
     if name is not None:
         state['name'] = name
+    if status == 'failed' and message:
+        state['error'] = message
+        if group == 'shots' and not state.get('original_error'):
+            state['original_error'] = message
     state.update(extra)
     states[str(key)] = state
     save_project(proj)
@@ -2118,7 +2183,7 @@ def initialize_item_states(proj, script):
                 "generation_started_at": result.get('generation_started_at'),
                 "generation_elapsed_seconds": elapsed,
             }
-        elif current.get('status') not in ('prompting', 'generating', 'failed'):
+        elif current.get('status') not in ('retrying', 'prompting', 'generating', 'failed'):
             shot_states[key] = {**current, "name": segment_label(shot, key), "status": "waiting", "progress": 0, "message": "等待生成", "updated": time.time()}
     save_project(proj)
     return states
@@ -2407,6 +2472,197 @@ def build_manual_h3_script(prompt, extracted, timeline):
     }
     return script, timeline['prompts']
 
+def update_production_job(proj, status, message='', **extra):
+    job = proj.setdefault('production_job', {})
+    job.update({'status': status, 'message': message, 'updated': time.time(), **extra})
+    return job
+
+def project_missing_shot_indexes(proj):
+    planned = (proj.get('script') or {}).get('shots') or []
+    required = {int(shot.get('index', i + 1)) for i, shot in enumerate(planned)}
+    completed = {
+        int(result.get('index')) for result in (proj.get('shots') or [])
+        if result.get('index') is not None and result.get('video_url')
+    }
+    return sorted(required - completed)
+
+def generate_project_shot(proj, shot_position, send):
+    """Generate one project segment from persisted script, prompt, assets and continuity."""
+    script = proj.get('script') or {}
+    shots = script.get('shots') or []
+    shot = shots[shot_position]
+    idx = int(shot.get('index', shot_position + 1))
+    label = segment_label(shot, idx)
+    pid = proj['id']
+    out_dir = os.path.join(OUTPUTS_DIR, pid)
+    os.makedirs(out_dir, exist_ok=True)
+    shot_results = proj.get('shots') or []
+    existing = next((result for result in shot_results
+                     if result.get('index') == idx and result.get('video_url')), None)
+    if existing:
+        publish_item_state(
+            proj, send, 'shots', idx, 'done', 100, '片段短片已完成', name=label,
+            generation_started_at=existing.get('generation_started_at'),
+            generation_elapsed_seconds=existing.get('generation_elapsed_seconds'))
+        send('shot', {
+            "index": idx, "segment_id": existing.get('segment_id', label),
+            "video_url": existing['video_url'], "prompt": existing.get('prompt', ''),
+            "refs": existing.get('refs', []), "duration": existing.get('duration', shot.get('duration', 8)),
+            "generation_started_at": existing.get('generation_started_at'),
+            "generation_elapsed_seconds": existing.get('generation_elapsed_seconds'),
+            "cached": True,
+        })
+        return existing, None
+
+    prompts_cache = proj.get('prompts', {})
+    h3_prompt = prompts_cache.get(str(idx))
+    continuity_needed = shot_position > 0 and segment_needs_previous_tail(shot, h3_prompt or '')
+    continuity_path = None
+    if continuity_needed:
+        previous_idx = int(shots[shot_position - 1].get('index', shot_position))
+        previous_result = next((result for result in shot_results if result.get('index') == previous_idx), None)
+        if not previous_result or not previous_result.get('path'):
+            message = f"{label}需要承接上一片段，但上一片段视频尚未保存"
+            publish_item_state(proj, send, 'shots', idx, 'failed', 0, message, name=label)
+            send('error', {"stage": 3, "msg": message})
+            return None, message
+        previous_path = previous_result['path']
+        if not os.path.isabs(previous_path):
+            previous_path = os.path.join(BASE_DIR, previous_path)
+        continuity_path = os.path.join(out_dir, f"continuity_{previous_idx:02d}_to_{idx:02d}.png")
+        publish_item_state(proj, send, 'shots', idx, 'prompting', 4, '正在提取上一片段尾帧', name=label)
+        tail_error = extract_video_tail_frame(previous_path, continuity_path)
+        if tail_error:
+            message = f"{label}连续性首帧准备失败: {tail_error}"
+            publish_item_state(proj, send, 'shots', idx, 'failed', 0, message, name=label)
+            send('error', {"stage": 3, "msg": message})
+            return None, message
+        send('shot_status', {"index": idx, "status": "prompt", "msg": f"{label}：已提取上一片段尾帧作为首帧连续性参考"})
+
+    ref_paths, board_ref_index, continuity_ref_index = assemble_shot_refs(
+        shot, proj.get('assets', {}), proj.get('generate_storyboards', True),
+        continuity_path=continuity_path)
+    if not ref_paths:
+        message = f"{label}无可用参考图"
+        publish_item_state(proj, send, 'shots', idx, 'failed', 0, '无可用参考图', name=label)
+        send('error', {"stage": 3, "msg": message})
+        return None, message
+
+    if h3_prompt:
+        publish_item_state(proj, send, 'shots', idx, 'prompting', 5, '正在读取预生成片段提示词', name=label)
+        send('shot_status', {"index": idx, "status": "prompt", "msg": f"{label}：使用预生成提示词", "prompt": h3_prompt})
+    else:
+        publish_item_state(proj, send, 'shots', idx, 'prompting', 3, 'AI正在编排片段提示词', name=label)
+        send('shot_status', {"index": idx, "status": "prompt", "msg": f"{label}：AI正在编排内部镜头..."})
+        h3_prompt, prompt_error = gen_shot_h3_prompt(
+            shot, ref_paths, board_ref_index, character_profiles_by_name(script),
+            continuity_ref_index=continuity_ref_index)
+        if not h3_prompt:
+            message = prompt_error or '提示词生成失败'
+            publish_item_state(proj, send, 'shots', idx, 'failed', 0, message, name=label)
+            send('error', {"stage": 3, "msg": f"{label}提示词生成失败: {message}"})
+            return None, message
+        h3_prompt = filter_slow_motion(h3_prompt)
+        prompts_cache[str(idx)] = h3_prompt
+        proj['prompts'] = prompts_cache
+        save_project(proj)
+
+    h3_prompt = apply_storyboard_reference(h3_prompt, board_ref_index)
+    h3_prompt = apply_continuity_reference(h3_prompt, continuity_ref_index)
+    h3_prompt = apply_character_visual_locks(h3_prompt, shot, character_profiles_by_name(script))
+    generation_started_at = time.time()
+    publish_item_state(
+        proj, send, 'shots', idx, 'generating', 8, 'H3正在加载模型并渲染片段短片', name=label,
+        generation_started_at=generation_started_at, generation_elapsed_seconds=None)
+    send('shot_status', {
+        "index": idx, "status": "render", "msg": f"{label}：H3正在渲染多镜头片段（耗时较长）...",
+        "prompt": h3_prompt, "generation_started_at": generation_started_at})
+    progress_cb = make_progress_publisher(
+        proj, send, 'shots', idx, None, label, 'H3片段正在采样', start=10, end=95)
+    video_info, video_error = gen_video_r2v(
+        h3_prompt, ref_paths, duration=shot.get('duration', 8),
+        save_name=f"shot_{idx:02d}.mp4", progress_cb=progress_cb,
+        preserve_prompt=(proj.get('input_mode') == 'h3_prompt'))
+    if video_info is None:
+        elapsed = round(time.time() - generation_started_at, 1)
+        message = video_error or '视频生成失败'
+        publish_item_state(
+            proj, send, 'shots', idx, 'failed', 0, message, name=label,
+            generation_started_at=generation_started_at, generation_elapsed_seconds=elapsed)
+        send('error', {"stage": 3, "msg": f"{label}视频生成失败: {message}"})
+        return None, message
+
+    video_path = os.path.join(out_dir, f"shot_{idx:02d}.mp4")
+    comfy_download(video_info, video_path)
+    elapsed = round(time.time() - generation_started_at, 1)
+    video_url = f"/file/outputs/{pid}/shot_{idx:02d}.mp4"
+    result = {
+        "index": idx, "segment_id": label, "video_url": video_url,
+        "prompt": h3_prompt, "path": video_path,
+        "refs": [os.path.relpath(path, BASE_DIR) for path in ref_paths],
+        "duration": shot.get('duration', 8),
+        "generation_started_at": generation_started_at,
+        "generation_elapsed_seconds": elapsed,
+        "continuity_from_previous": continuity_needed,
+        "continuity_frame": os.path.relpath(continuity_path, BASE_DIR) if continuity_path else None,
+    }
+    proj['shots'] = [row for row in shot_results if row.get('index') != idx] + [result]
+    publish_item_state(
+        proj, send, 'shots', idx, 'done', 100, '片段短片已完成', name=label,
+        generation_started_at=generation_started_at, generation_elapsed_seconds=elapsed)
+    send('shot', {key: result[key] for key in (
+        'index', 'video_url', 'prompt', 'refs', 'duration',
+        'generation_started_at', 'generation_elapsed_seconds')})
+    return result, None
+
+def finalize_project_video(proj, send):
+    """Compose completed segments while keeping finalization errors separate from shot status."""
+    missing = project_missing_shot_indexes(proj)
+    if missing:
+        return False, f"仍有{len(missing)}个片段待生成"
+    update_production_job(proj, 'merging', '正在合并所有片段', stage='finalizing')
+    save_project(proj)
+    send('stage', {"stage": 4, "name": "视频合成", "status": "running", "msg": "正在合并所有片段..."})
+    try:
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg:
+            message = "未检测到ffmpeg（整合包tools/ffmpeg与系统PATH均无）"
+            update_production_job(proj, 'failed', message, stage='finalizing')
+            save_project(proj)
+            send('error', {"stage": 4, "msg": message})
+            return False, message
+        out_dir = os.path.join(OUTPUTS_DIR, proj['id'])
+        os.makedirs(out_dir, exist_ok=True)
+        ordered = sorted(proj.get('shots') or [], key=lambda result: result['index'])
+        with open(os.path.join(out_dir, 'concat.txt'), 'w', encoding='utf-8') as stream:
+            for result in ordered:
+                stream.write(f"file '{os.path.basename(result['path'])}'\n")
+        proc = subprocess.run(
+            [ffmpeg, '-y', '-f', 'concat', '-safe', '0', '-i', 'concat.txt', '-c', 'copy', 'final.mp4'],
+            cwd=out_dir, capture_output=True, text=True, timeout=300)
+        if proc.returncode != 0:
+            proc = subprocess.run(
+                [ffmpeg, '-y', '-f', 'concat', '-safe', '0', '-i', 'concat.txt', '-c:v', 'libx264', '-c:a', 'aac', 'final.mp4'],
+                cwd=out_dir, capture_output=True, text=True, timeout=600)
+        if proc.returncode != 0:
+            message = f"ffmpeg合并失败: {proc.stderr[-300:]}"
+            update_production_job(proj, 'failed', message, stage='finalizing')
+            save_project(proj)
+            send('error', {"stage": 4, "msg": message})
+            return False, message
+    except Exception as exc:
+        message = f"ffmpeg执行异常: {exc}"
+        update_production_job(proj, 'failed', message, stage='finalizing')
+        save_project(proj)
+        send('error', {"stage": 4, "msg": message})
+        return False, message
+    proj['final'] = f"/file/outputs/{proj['id']}/final.mp4"
+    update_production_job(proj, 'done', '成片已生成', stage='complete')
+    save_project(proj)
+    send('stage', {"stage": 4, "name": "视频合成", "status": "done"})
+    send('final', {"video_url": proj['final'], "title": proj.get('title', '短剧')})
+    return True, None
+
 def run_pipeline(pid, idea, send, custom_assets=False, input_mode='story'):
     """完整短剧生成管线，send(event, data)推送进度"""
     proj = load_project(pid)
@@ -2422,6 +2678,7 @@ def run_pipeline(pid, idea, send, custom_assets=False, input_mode='story'):
             idea = proj.get('manual_h3_prompt') or proj.get('idea') or idea
     if custom_assets:
         proj['custom_assets'] = True
+    update_production_job(proj, 'running', '正在生成短剧', stage='production')
     save_project(proj)
     out_dir = os.path.join(OUTPUTS_DIR, pid)
     os.makedirs(out_dir, exist_ok=True)
@@ -2711,149 +2968,21 @@ def run_pipeline(pid, idea, send, custom_assets=False, input_mode='story'):
 
     # ---------- 阶段3：片段视频生成 ----------
     send('stage', {"stage": 3, "name": "片段视频", "status": "running", "msg": "正在逐片生成视频..."})
-    shot_results = proj.get('shots', [])
-    for i, shot in enumerate(shots):
-        idx = shot.get('index', i + 1)
-        label = segment_label(shot, idx)
-        existing = next((r for r in shot_results if r.get('index') == idx), None)
-        if existing and existing.get('video_url'):
-            publish_item_state(
-                proj, send, 'shots', idx, 'done', 100, '片段短片已完成', name=label,
-                generation_started_at=existing.get('generation_started_at'),
-                generation_elapsed_seconds=existing.get('generation_elapsed_seconds'))
-            send('shot', {
-                "index": idx, "segment_id": existing.get('segment_id', label),
-                "video_url": existing['video_url'], "prompt": existing.get('prompt', ''),
-                "refs": existing.get('refs', []), "duration": existing.get('duration', shot.get('duration', 8)),
-                "generation_started_at": existing.get('generation_started_at'),
-                "generation_elapsed_seconds": existing.get('generation_elapsed_seconds'),
-                "cached": True,
-            })
-            continue
-        prompts_cache = proj.get('prompts', {})
-        h3_prompt = prompts_cache.get(str(idx))
-        continuity_needed = i > 0 and segment_needs_previous_tail(shot, h3_prompt or '')
-        continuity_path = None
-        if continuity_needed:
-            previous_idx = shots[i - 1].get('index', i)
-            previous_result = next((r for r in shot_results if r.get('index') == previous_idx), None)
-            if not previous_result or not previous_result.get('path'):
-                message = f"{label}需要承接上一片段，但上一片段视频尚未保存"
-                publish_item_state(proj, send, 'shots', idx, 'failed', 0, message, name=label)
-                send('error', {"stage": 3, "msg": message})
-                return
-            continuity_path = os.path.join(out_dir, f"continuity_{int(previous_idx):02d}_to_{int(idx):02d}.png")
-            publish_item_state(proj, send, 'shots', idx, 'prompting', 4, '正在提取上一片段尾帧', name=label)
-            tail_error = extract_video_tail_frame(previous_result.get('path'), continuity_path)
-            if tail_error:
-                message = f"{label}连续性首帧准备失败: {tail_error}"
-                publish_item_state(proj, send, 'shots', idx, 'failed', 0, message, name=label)
-                send('error', {"stage": 3, "msg": message})
-                return
-            send('shot_status', {"index": idx, "status": "prompt", "msg": f"{label}：已提取上一片段尾帧作为首帧连续性参考"})
-        # 组装参考图（每片上限9张）：角色 → 场景 → 道具 → 可选分镜图 → 可选上一片尾帧。
-        ref_paths, board_ref_index, continuity_ref_index = assemble_shot_refs(
-            shot, assets, proj.get('generate_storyboards', True), continuity_path=continuity_path)
-        if not ref_paths:
-            publish_item_state(proj, send, 'shots', idx, 'failed', 0, '无可用参考图', name=label)
-            send('error', {"stage": 3, "msg": f"{label}无可用参考图"})
-            return
-        # H3提示词：优先使用互斥模式预生成的缓存，否则即时调用LLM（多模态看图）
-        if h3_prompt:
-            publish_item_state(proj, send, 'shots', idx, 'prompting', 5, '正在读取预生成片段提示词', name=label)
-            send('shot_status', {"index": idx, "status": "prompt", "msg": f"{label}：使用预生成提示词", "prompt": h3_prompt})
-        else:
-            publish_item_state(proj, send, 'shots', idx, 'prompting', 3, 'AI正在编排片段提示词', name=label)
-            send('shot_status', {"index": idx, "status": "prompt", "msg": f"{label}：AI正在编排内部镜头..."})
-            h3_prompt, perr = gen_shot_h3_prompt(
-                shot, ref_paths, board_ref_index, character_profiles_by_name(proj.get('script')),
-                continuity_ref_index=continuity_ref_index)
-            if not h3_prompt:
-                publish_item_state(proj, send, 'shots', idx, 'failed', 0, perr or '提示词生成失败', name=label)
-                send('error', {"stage": 3, "msg": f"{label}提示词生成失败: {perr}"})
-                return
-            h3_prompt = filter_slow_motion(h3_prompt)
-            prompts_cache[str(idx)] = h3_prompt
-            proj['prompts'] = prompts_cache
+    for position, _shot in enumerate(shots):
+        _result, error = generate_project_shot(proj, position, send)
+        if error:
+            update_production_job(proj, 'failed', error, stage='production')
             save_project(proj)
-        h3_prompt = apply_storyboard_reference(h3_prompt, board_ref_index)
-        h3_prompt = apply_continuity_reference(h3_prompt, continuity_ref_index)
-        h3_prompt = apply_character_visual_locks(
-            h3_prompt, shot, character_profiles_by_name(proj.get('script')))
-        # 提交ComfyUI r2v
-        generation_started_at = time.time()
-        publish_item_state(
-            proj, send, 'shots', idx, 'generating', 8, 'H3正在加载模型并渲染片段短片', name=label,
-            generation_started_at=generation_started_at, generation_elapsed_seconds=None)
-        send('shot_status', {
-            "index": idx, "status": "render", "msg": f"{label}：H3正在渲染多镜头片段（耗时较长）...",
-            "prompt": h3_prompt, "generation_started_at": generation_started_at})
-        progress_cb = make_progress_publisher(proj, send, 'shots', idx, None, label, 'H3片段正在采样', start=10, end=95)
-        video_info, save_name = gen_video_r2v(h3_prompt, ref_paths, duration=shot.get('duration', 8), save_name=f"shot_{idx:02d}.mp4", progress_cb=progress_cb, preserve_prompt=(input_mode == 'h3_prompt'))
-        if video_info is None:
-            generation_elapsed_seconds = round(time.time() - generation_started_at, 1)
-            publish_item_state(
-                proj, send, 'shots', idx, 'failed', 0, save_name or '视频生成失败', name=label,
-                generation_started_at=generation_started_at,
-                generation_elapsed_seconds=generation_elapsed_seconds)
-            send('error', {"stage": 3, "msg": f"{label}视频生成失败: {save_name}"})
             return
-        video_path = os.path.join(out_dir, f"shot_{idx:02d}.mp4")
-        comfy_download(video_info, video_path)
-        generation_elapsed_seconds = round(time.time() - generation_started_at, 1)
-        video_url = f"/file/outputs/{pid}/shot_{idx:02d}.mp4"
-        shot_results = [r for r in shot_results if r.get('index') != idx]
-        shot_results.append({"index": idx, "segment_id": label, "video_url": video_url, "prompt": h3_prompt, "path": video_path,
-                             "refs": [os.path.relpath(p, BASE_DIR) for p in ref_paths],
-                             "duration": shot.get('duration', 8),
-                             "generation_started_at": generation_started_at,
-                             "generation_elapsed_seconds": generation_elapsed_seconds,
-                             "continuity_from_previous": continuity_needed,
-                             "continuity_frame": os.path.relpath(continuity_path, BASE_DIR) if continuity_path else None})
-        proj['shots'] = shot_results
-        publish_item_state(
-            proj, send, 'shots', idx, 'done', 100, '片段短片已完成', name=label,
-            generation_started_at=generation_started_at,
-            generation_elapsed_seconds=generation_elapsed_seconds)
-        send('shot', {"index": idx, "video_url": video_url, "prompt": h3_prompt,
-                      "refs": [os.path.relpath(p, BASE_DIR) for p in ref_paths],
-                      "duration": shot.get('duration', 8),
-                      "generation_started_at": generation_started_at,
-                      "generation_elapsed_seconds": generation_elapsed_seconds})
-        send('progress', {"stage": 3, "done": len(shot_results), "total": len(shots)})
+        send('progress', {
+            "stage": 3,
+            "done": len(proj.get('shots') or []),
+            "total": len(shots),
+        })
     send('stage', {"stage": 3, "name": "片段视频", "status": "done"})
 
     # ---------- 阶段4：视频合成 ----------
-    send('stage', {"stage": 4, "name": "视频合成", "status": "running", "msg": "正在合并所有片段..."})
-    ffmpeg = find_ffmpeg()
-    if not ffmpeg:
-        send('error', {"stage": 4, "msg": "未检测到ffmpeg（整合包tools/ffmpeg与系统PATH均无）"})
-        return
-    ordered = sorted(shot_results, key=lambda r: r['index'])
-    list_file = os.path.join(out_dir, 'concat.txt')
-    with open(list_file, 'w', encoding='utf-8') as f:
-        for r in ordered:
-            f.write(f"file '{os.path.basename(r['path'])}'\n")
-    final_path = os.path.join(out_dir, 'final.mp4')
-    try:
-        proc = subprocess.run(
-            [ffmpeg, '-y', '-f', 'concat', '-safe', '0', '-i', 'concat.txt', '-c', 'copy', 'final.mp4'],
-            cwd=out_dir, capture_output=True, text=True, timeout=300)
-        if proc.returncode != 0:
-            # copy失败则重编码
-            proc = subprocess.run(
-                [ffmpeg, '-y', '-f', 'concat', '-safe', '0', '-i', 'concat.txt', '-c:v', 'libx264', '-c:a', 'aac', 'final.mp4'],
-                cwd=out_dir, capture_output=True, text=True, timeout=600)
-            if proc.returncode != 0:
-                send('error', {"stage": 4, "msg": f"ffmpeg合并失败: {proc.stderr[-300:]}"})
-                return
-    except Exception as e:
-        send('error', {"stage": 4, "msg": f"ffmpeg执行异常: {e}"})
-        return
-    proj['final'] = f"/file/outputs/{pid}/final.mp4"
-    save_project(proj)
-    send('stage', {"stage": 4, "name": "视频合成", "status": "done"})
-    send('final', {"video_url": proj['final'], "title": proj.get('title', '短剧')})
+    finalize_project_video(proj, send)
 
 # ============================== 单镜头生成器 API ==============================
 @app.route('/api/single_shot/upload', methods=['POST'])
@@ -2957,6 +3086,176 @@ def single_shot_status(task_id):
     if not t:
         return jsonify({"status": "error", "msg": "任务不存在"}), 404
     return jsonify(t)
+
+def recover_interrupted_shot_retries(proj):
+    """Recover persisted production state only when no process still owns this project."""
+    pid = proj.get('id')
+    states = (proj.get('item_states') or {}).get('shots') or {}
+    interrupted = [
+        state for state in states.values()
+        if state.get('retry_count') and state.get('status') in ('retrying', 'prompting', 'generating')
+    ]
+    production_job = proj.get('production_job') or {}
+    job_status = production_job.get('status')
+    if (not interrupted and job_status not in ACTIVE_PRODUCTION_STATUSES) or project_job_active(pid):
+        return False
+    message = ("服务重启导致视频合成中断，可从断点继续"
+               if job_status == 'merging'
+               else "服务重启导致生成任务中断，可继续生成")
+    for state in states.values():
+        if not state.get('retry_count') or state.get('status') not in ('retrying', 'prompting', 'generating'):
+            continue
+        message = "服务重启导致片段重试中断，可再次重新生成"
+        state.update({
+            'status': 'failed', 'progress': 0, 'message': message,
+            'error': message, 'updated': time.time(),
+        })
+    stage = production_job.get('stage') or ('finalizing' if job_status == 'merging' else 'production')
+    update_production_job(proj, 'failed', message, stage=stage)
+    save_project(proj)
+    return True
+
+def run_project_shot_retry(pid, index, job_id):
+    """Retry exactly one failed project segment and leave every completed segment untouched."""
+    def capture(event, data):
+        return None
+
+    def fail_retry(project, planned_shot, message):
+        state = (((project.get('item_states') or {}).get('shots') or {}).get(str(index), {}))
+        set_item_state(
+            project, 'shots', index, 'failed', 0, message,
+            name=state.get('name') or segment_label(planned_shot, index),
+        )
+        update_production_job(project, 'failed', message, stage='production')
+        save_project(project)
+
+    try:
+        proj = load_project(pid)
+        if not proj:
+            return
+        shots = (proj.get('script') or {}).get('shots') or []
+        position = next((pos for pos, shot in enumerate(shots)
+                         if int(shot.get('index', pos + 1)) == index), None)
+        if position is None:
+            update_production_job(proj, 'failed', f'片段{index}不存在', stage='production')
+            save_project(proj)
+            return
+        planned = shots[position]
+
+        if not (proj.get('prompts') or {}).get(str(index)):
+            publish_item_state(
+                proj, capture, 'shots', index, 'prompting', 2,
+                '正在准备片段提示词', name=segment_label(planned, index))
+            ready, service_error = prepare_llm_stage()
+            if not ready:
+                fail_retry(proj, planned, f"LLM服务不可用: {service_error}")
+                return
+            continuity_needed = position > 0 and segment_needs_previous_tail(planned)
+            prompt_refs, board_ref_index, continuity_ref_index = assemble_shot_refs(
+                planned, proj.get('assets', {}), proj.get('generate_storyboards', True),
+                reserve_continuity=continuity_needed)
+            if not prompt_refs:
+                fail_retry(proj, planned, '无可用参考图')
+                return
+            prompt, prompt_error = gen_shot_h3_prompt(
+                planned, prompt_refs, board_ref_index,
+                character_profiles_by_name(proj.get('script')),
+                continuity_ref_index=continuity_ref_index)
+            if not prompt:
+                fail_retry(proj, planned, prompt_error or '提示词生成失败')
+                return
+            proj.setdefault('prompts', {})[str(index)] = filter_slow_motion(prompt)
+            proj['prompt_format_version'] = H3_PROMPT_FORMAT_VERSION
+            save_project(proj)
+
+        if not prepare_comfy_stage():
+            fail_retry(proj, planned, f"ComfyUI不可用或互斥切换失败: {comfy_url()}")
+            return
+        result, error = generate_project_shot(proj, position, capture)
+        if error or not result:
+            update_production_job(proj, 'failed', error or '片段重试未完成', stage='production')
+            save_project(proj)
+            return
+        missing = project_missing_shot_indexes(proj)
+        if missing:
+            message = f"片段{index}重试完成，仍有{len(missing)}个片段待生成"
+            update_production_job(proj, 'done', message, stage='production')
+            save_project(proj)
+            return
+        finalize_project_video(proj, capture)
+    except Exception as exc:
+        print(f"[片段重试] {pid}/{index} 异常: {exc}")
+        proj = load_project(pid)
+        if proj:
+            completed = next((shot for shot in (proj.get('shots') or [])
+                              if shot.get('index') == index and shot.get('video_url')), None)
+            if not completed:
+                state = (((proj.get('item_states') or {}).get('shots') or {}).get(str(index), {}))
+                set_item_state(
+                    proj, 'shots', index, 'failed', 0, '片段重试异常，请查看服务日志',
+                    name=state.get('name'))
+            update_production_job(proj, 'failed', '片段重试异常，请查看服务日志', stage='production')
+            save_project(proj)
+    finally:
+        release_project_job(pid, job_id)
+
+@app.route('/api/project/<pid>/shot/<int:index>/retry', methods=['POST'])
+def project_shot_retry(pid, index):
+    if not re.fullmatch(r'[0-9a-zA-Z_-]{1,64}', pid):
+        return jsonify({"ok": False, "msg": "非法项目ID"}), 400
+    proj = load_project(pid)
+    if not proj:
+        return jsonify({"ok": False, "msg": "项目不存在"}), 404
+    recover_interrupted_shot_retries(proj)
+    planned = next((shot for shot in (proj.get('script') or {}).get('shots', [])
+                    if int(shot.get('index', 0) or 0) == index), None)
+    if not planned:
+        return jsonify({"ok": False, "msg": f"片段{index}不存在"}), 404
+    completed = next((shot for shot in proj.get('shots', [])
+                     if shot.get('index') == index and shot.get('video_url')), None)
+    if completed:
+        return jsonify({"ok": False, "msg": f"片段{index}已经生成完成，无需重试"}), 409
+
+    state = (((proj.get('item_states') or {}).get('shots') or {}).get(str(index), {}))
+    if state.get('status') != 'failed':
+        if project_job_active(pid):
+            return jsonify({"ok": False, "msg": "该项目已有生成任务，请等待当前任务结束"}), 409
+        return jsonify({"ok": False, "msg": f"片段{index}当前不是失败状态"}), 409
+    job_id = uuid.uuid4().hex
+    if not claim_project_job(pid, job_id):
+        return jsonify({"ok": False, "msg": "该项目已有生成任务，请等待当前任务结束"}), 409
+    original_error = state.get('original_error') or state.get('error') or state.get('message') or '视频生成失败'
+    try:
+        try:
+            retry_count = max(0, int(state.get('retry_count') or 0)) + 1
+        except (TypeError, ValueError):
+            retry_count = 1
+        queued = set_item_state(
+            proj, 'shots', index, 'retrying', 0, f"第{retry_count}次重试已加入队列",
+            name=state.get('name') or segment_label(planned, index),
+            retry_count=retry_count, original_error=original_error,
+        )
+        update_production_job(
+            proj, 'retrying', queued['message'], job_id=job_id,
+            kind='shot_retry', shot_index=index, stage='production')
+        save_project(proj)
+        threading.Thread(
+            target=run_project_shot_retry, args=(pid, index, job_id), daemon=True).start()
+    except Exception as exc:
+        print(f"[片段重试] {pid}/{index} 启动失败: {exc}")
+        release_project_job(pid, job_id)
+        try:
+            failed = set_item_state(
+                proj, 'shots', index, 'failed', 0, '无法启动片段重试，请查看服务日志',
+                name=state.get('name') or segment_label(planned, index),
+                retry_count=locals().get('retry_count', 1), original_error=original_error,
+            )
+            update_production_job(proj, 'failed', failed['message'], stage='production')
+            save_project(proj)
+        except Exception as save_error:
+            print(f"[片段重试] {pid}/{index} 失败状态保存异常: {save_error}")
+        return jsonify({"ok": False, "msg": "无法启动片段重试，请查看服务日志"}), 500
+    return jsonify({"ok": True, "started": True, "item_state": queued}), 202
 
 @app.route('/api/project/<pid>/shot/<int:index>/replace', methods=['POST'])
 def project_shot_replace(pid, index):
@@ -3098,6 +3397,8 @@ def api_comfy_queue():
 def api_pipeline_run():
     idea = request.args.get('idea', '').strip()
     pid = request.args.get('pid') or uuid.uuid4().hex[:12]
+    if not re.fullmatch(r'[0-9a-zA-Z_-]{1,64}', pid):
+        return jsonify({"ok": False, "msg": "非法项目ID"}), 400
     input_mode = 'h3_prompt' if request.args.get('input_mode') == 'h3_prompt' else 'story'
     scene_mode_arg = request.args.get('scene_reference_mode', '').lower()
     if scene_mode_arg in ('auto', 'photo', 'concept'):
@@ -3144,11 +3445,15 @@ def api_pipeline_run():
     custom_assets = (request.args.get('custom_assets') == '1')
     if not idea and not load_project(pid):
         return jsonify({"ok": False, "msg": "请输入创作内容"}), 400
+    job_id = uuid.uuid4().hex
     def stream():
+        if not claim_project_job(pid, job_id):
+            yield sse('error', {"msg": "该项目已有生成任务，请等待当前任务结束"})
+            yield sse('end', {})
+            return
         queue = []
         def push(event, data):
             queue.append(sse(event, data))
-        yield sse('start', {"pid": pid})
         # 在线程中跑管线，主线程吐队列
         def worker():
             try:
@@ -3157,9 +3462,28 @@ def api_pipeline_run():
                 import traceback
                 traceback.print_exc()
                 push('error', {"msg": f"管线异常: {e}"})
-            push('end', {})
+            finally:
+                try:
+                    finished = load_project(pid)
+                    if finished and (finished.get('production_job') or {}).get('status') in ACTIVE_PRODUCTION_STATUSES:
+                        message = '生成任务未完成，请查看失败项后继续'
+                        stage = (finished.get('production_job') or {}).get('stage') or 'production'
+                        update_production_job(finished, 'failed', message, stage=stage)
+                        save_project(finished)
+                except Exception as finish_error:
+                    print(f"[生成任务] {pid} 收尾状态保存失败: {finish_error}")
+                finally:
+                    release_project_job(pid, job_id)
+                    push('end', {})
         t = threading.Thread(target=worker, daemon=True)
-        t.start()
+        try:
+            t.start()
+        except Exception:
+            release_project_job(pid, job_id)
+            yield sse('error', {"msg": "无法启动生成任务，请查看服务日志"})
+            yield sse('end', {})
+            return
+        yield sse('start', {"pid": pid})
         while True:
             if queue:
                 yield queue.pop(0)
@@ -4045,6 +4369,7 @@ def api_project(pid):
     p = load_project(pid)
     if not p:
         return jsonify({"ok": False, "msg": "项目不存在"}), 404
+    recover_interrupted_shot_retries(p)
     # 转换资产路径为URL
     assets_view = []
     for k, a in p.get('assets', {}).items():
@@ -4059,6 +4384,7 @@ def api_project(pid):
         "custom_assets": p.get('custom_assets'), "assets_confirmed": p.get('assets_confirmed'),
         "generate_storyboards": p.get('generate_storyboards', True),
         "item_states": p.get('item_states', {}),
+        "production_job": p.get('production_job', {}),
         "preproduction": preproduction_view(p) if p.get('preproduction') else None,
         "prompts": p.get('prompts', {}), "style": p.get('style')
     }})
