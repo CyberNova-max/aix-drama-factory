@@ -90,7 +90,7 @@
       "steps": 25,
       "denoise": 1,
       "model": [
-        "accel:te",
+        "accel:ffn",
         0
       ]
     },
@@ -130,7 +130,7 @@
   "105:16": {
     "inputs": {
       "model": [
-        "accel:te",
+        "accel:ffn",
         0
       ],
       "conditioning": [
@@ -165,21 +165,31 @@
       "title": "MiniMax H3 专用 SageAttention"
     }
   },
-  "accel:te": {
+  "accel:lowvram": {
     "inputs": {
-      "processing_control_value": 0.12,
-      "processing_percent_1": 0.1,
-      "processing_percent_2": 0.9,
-      "mcs": 2,
-      "device": "auto",
+      "head_chunks": 4,
       "model": [
         "accel:sage",
         0
       ]
     },
-    "class_type": "TESpeedMiniMaxH3",
+    "class_type": "MiniMaxLowVRAMAttention",
     "_meta": {
-      "title": "TE-Speed MiniMax H3"
+      "title": "MiniMax H3 低显存分块注意力"
+    }
+  },
+  "accel:ffn": {
+    "inputs": {
+      "chunks": 4,
+      "seq_threshold": 4096,
+      "model": [
+        "accel:lowvram",
+        0
+      ]
+    },
+    "class_type": "MiniMaxChunkFeedForward",
+    "_meta": {
+      "title": "MiniMax H3 低显存分块前馈"
     }
   },
   "105:13": {
