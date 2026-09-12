@@ -388,6 +388,56 @@ class ShotRetryTests(unittest.TestCase):
         self.assertEqual(second.status_code, 409)
         self.assertIn('已有生成任务', second.get_json()['msg'])
 
+    @patch.object(factory.threading, 'Thread')
+    def test_retry_revalidates_project_after_claiming_lock(self, thread_cls):
+        self.save_failed_project()
+        original_claim = factory.claim_project_job
+
+        def claim_after_previous_completion(pid, job_id):
+            claimed = original_claim(pid, job_id)
+            if claimed:
+                latest = factory.load_project(pid)
+                latest['shots'] = [{
+                    'index': 1, 'video_url': '/file/outputs/retry-project/shot_01.mp4',
+                    'path': 'outputs/retry-project/shot_01.mp4',
+                }]
+                latest['item_states']['shots']['1']['status'] = 'done'
+                factory.save_project(latest)
+            return claimed
+
+        with patch.object(factory, 'claim_project_job', side_effect=claim_after_previous_completion):
+            response = self.client.post('/api/project/retry-project/shot/1/retry')
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn('已经生成完成', response.get_json()['msg'])
+        self.assertFalse(factory.project_job_active('retry-project'))
+        thread_cls.return_value.start.assert_not_called()
+
+    def test_retry_revalidation_error_releases_project_lock(self):
+        self.save_failed_project()
+        original_claim = factory.claim_project_job
+        original_load = factory.load_project
+        retry_claimed = False
+
+        def tracking_claim(pid, job_id):
+            nonlocal retry_claimed
+            claimed = original_claim(pid, job_id)
+            if claimed and not job_id.startswith('recovery-'):
+                retry_claimed = True
+            return claimed
+
+        def fail_after_retry_claim(pid):
+            if retry_claimed:
+                raise PermissionError('project temporarily unreadable')
+            return original_load(pid)
+
+        with patch.object(factory, 'claim_project_job', side_effect=tracking_claim), \
+                patch.object(factory, 'load_project', side_effect=fail_after_retry_claim):
+            response = self.client.post('/api/project/retry-project/shot/1/retry')
+
+        self.assertEqual(response.status_code, 500)
+        self.assertFalse(factory.project_job_active('retry-project'))
+
     @patch.object(factory, 'save_config')
     def test_project_lock_rejects_full_pipeline_while_retry_is_active(self, _save_config):
         self.save_failed_project()
@@ -431,7 +481,7 @@ class ShotRetryTests(unittest.TestCase):
         self.assertIsNone(saved.get('final'))
         generate.assert_called_once()
         ffmpeg.assert_not_called()
-        self.assertEqual(saved['production_job']['status'], 'done')
+        self.assertEqual(saved['production_job']['status'], 'partial')
         self.assertIn('仍有1个片段待生成', saved['production_job']['message'])
 
     def test_project_read_recovers_interrupted_retry(self):

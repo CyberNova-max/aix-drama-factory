@@ -128,7 +128,8 @@ _PREP_ASSET_STATE_LOCK = threading.RLock()
 _PROJECT_IO_LOCK = threading.RLock()
 _PROJECT_JOB_LOCK = threading.RLock()
 _PROJECT_JOB_HANDLES = {}
-ACTIVE_PRODUCTION_STATUSES = {'running', 'retrying', 'merging'}
+ACTIVE_PRODUCTION_STATUSES = {'queued', 'running', 'retrying', 'merging', 'stopping'}
+TERMINAL_PRODUCTION_STATUSES = {'done', 'failed', 'stopped', 'partial'}
 
 def _lock_project_job_file(pid):
     """Acquire a non-blocking per-project OS lock shared by local/cloud workers."""
@@ -277,7 +278,7 @@ def get_llm_endpoint():
         return base, CONFIG.get('custom_api_key', 'EMPTY'), CONFIG.get('custom_model', '')
     return CONFIG.get('local_llm_url', 'http://127.0.0.1:8085').rstrip('/'), 'EMPTY', CONFIG.get('local_llm_model', 'qwen3.5-4b')
 
-def llm_chat(messages, max_tokens=4096, temperature=0.7, retries=None):
+def llm_chat(messages, max_tokens=4096, temperature=0.7, retries=None, stop_check=None):
     if retries is None:
         retries = max(0, int(CONFIG.get('llm_retries', 3)))
     base, key, model = get_llm_endpoint()
@@ -293,6 +294,8 @@ def llm_chat(messages, max_tokens=4096, temperature=0.7, retries=None):
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
     last_err = None
     for attempt in range(retries + 1):
+        if stop_check and stop_check():
+            raise ProjectStopRequested('当前项目已收到停止请求')
         try:
             r = requests.post(f"{base}/chat/completions", json=payload, headers=headers, timeout=600)
             r.raise_for_status()
@@ -306,6 +309,8 @@ def llm_chat(messages, max_tokens=4096, temperature=0.7, retries=None):
         except Exception as e:
             last_err = str(e)
             print(f"[LLM] 第{attempt+1}次调用失败: {e}")
+            if stop_check and stop_check():
+                raise ProjectStopRequested('当前项目已收到停止请求')
             http_server_error = (isinstance(e, requests.exceptions.HTTPError) and
                                  getattr(e.response, 'status_code', 0) >= 500)
             retryable_service_error = isinstance(e, (requests.exceptions.ConnectionError,
@@ -314,11 +319,16 @@ def llm_chat(messages, max_tokens=4096, temperature=0.7, retries=None):
                            CONFIG.get('llm_mode') == 'local' and
                            CONFIG.get('llm_auto_recover', True))
             if can_recover:
+                if stop_check and stop_check():
+                    raise ProjectStopRequested('当前项目已收到停止请求')
                 print("[LLM] 检测到本地服务中断，正在自动恢复；恢复后重试当前请求...")
                 ok, recover_err = ensure_local_llm()
                 if not ok:
                     last_err = f"本地LLM自动恢复失败: {recover_err}"
                     print(f"[LLM] {last_err}")
+        if stop_check and stop_check():
+            raise ProjectStopRequested('当前项目已收到停止请求')
+        if attempt < retries:
             time.sleep(2)
     return None, last_err
 
@@ -575,6 +585,65 @@ def _comfy_queue_prompt_ids(queue_data):
                 prompt_ids.add(str(item['prompt_id']))
     return prompt_ids
 
+def _comfy_queue_prompt_state(queue_data, prompt_id):
+    """Return the state of one prompt without making assumptions about other jobs."""
+    target = str(prompt_id)
+    for key, state in (('queue_running', 'running'), ('queue_pending', 'pending')):
+        for item in (queue_data or {}).get(key, []):
+            item_id = None
+            if isinstance(item, (list, tuple)) and len(item) > 1:
+                item_id = item[1]
+            elif isinstance(item, dict):
+                item_id = item.get('prompt_id')
+            if item_id is not None and str(item_id) == target:
+                return state
+    return None
+
+def comfy_cancel_prompt_safely(prompt_id):
+    """Cancel only one owned prompt; never fall back to ComfyUI's global interrupt."""
+    prompt_id = str(prompt_id or '').strip()
+    if not prompt_id:
+        return 'none', '当前项目没有已提交的 ComfyUI 任务'
+
+    # New ComfyUI versions expose an atomic, idempotent per-job cancellation API.
+    # A 404 means the route is unavailable on older installations, so fall back
+    # only to deleting this exact prompt while it is still pending.
+    try:
+        encoded = requests.utils.quote(prompt_id, safe='')
+        response = requests.post(
+            f"{comfy_url()}/api/jobs/{encoded}/cancel", timeout=10)
+        if response.status_code == 200:
+            cancelled = bool((response.json() or {}).get('cancelled'))
+            return ('cancelled' if cancelled else 'terminal'), (
+                '已向 ComfyUI 发送当前任务的定向停止请求'
+                if cancelled else '当前 ComfyUI 任务已结束或无需取消')
+        if response.status_code not in (404, 405):
+            return 'deferred', f'ComfyUI 定向停止返回 HTTP {response.status_code}，将在当前步骤结束后停止'
+    except Exception as exc:
+        print(f"[ComfyUI] 定向停止接口不可用，检查精确队列删除: {exc}")
+
+    try:
+        queue_response = requests.get(f"{comfy_url()}/queue", timeout=5)
+        queue_response.raise_for_status()
+        state = _comfy_queue_prompt_state(queue_response.json(), prompt_id)
+        if state == 'pending':
+            response = requests.post(
+                f"{comfy_url()}/queue", json={'delete': [prompt_id]}, timeout=10)
+            response.raise_for_status()
+            verify = requests.get(f"{comfy_url()}/queue", timeout=5)
+            verify.raise_for_status()
+            remaining = _comfy_queue_prompt_state(verify.json(), prompt_id)
+            if remaining is None:
+                return 'cancelled', '已从 ComfyUI 队列删除当前项目的等待任务'
+            if remaining == 'running':
+                return 'deferred', '任务已开始运行；当前 ComfyUI 版本不支持安全定向中断，将在当前步骤结束后停止'
+            return 'deferred', 'ComfyUI 尚未确认删除等待任务，将继续等待当前步骤结束'
+        if state == 'running':
+            return 'deferred', '当前 ComfyUI 版本不支持安全停止运行中任务，将在当前步骤结束后停止'
+        return 'terminal', '当前 ComfyUI 任务已结束或已离开队列'
+    except Exception as exc:
+        return 'deferred', f'无法确认 ComfyUI 定向停止能力，将在当前步骤结束后停止：{exc}'
+
 def comfy_wait_prompt_exit(prompt_id, timeout=30, interval=0.5):
     """Wait for one failed prompt to leave the queue without interrupting any work."""
     deadline = time.monotonic() + max(0, timeout)
@@ -829,11 +898,29 @@ def comfy_open_ws(client_id):
     ws.settimeout(1.0)
     return ws
 
-def comfy_wait(prompt_id, timeout=1200, interval=3, progress_cb=None, ws=None):
+def comfy_wait(prompt_id, timeout=1200, interval=3, progress_cb=None, ws=None,
+               stop_check=None, stop_handler=None):
     start = time.time()
     last_poll = 0
+    stop_deferred = False
+    cancel_requested = False
+    cancel_left_queue_at = None
     try:
         while time.time() - start < timeout:
+            if stop_check and stop_check():
+                if not stop_deferred:
+                    action, message = (stop_handler(prompt_id) if stop_handler
+                                       else ('deferred', '将在当前步骤结束后停止'))
+                    if action == 'cancelled':
+                        exited, _ = comfy_wait_prompt_exit(prompt_id, timeout=5)
+                        stop_deferred = True
+                        cancel_requested = True
+                        if exited:
+                            cancel_left_queue_at = time.monotonic()
+                    elif action == 'none':
+                        return None, f"__AIX_STOPPED__:{message}"
+                    else:
+                        stop_deferred = True
             if ws is not None:
                 try:
                     raw = ws.recv()
@@ -848,6 +935,8 @@ def comfy_wait(prompt_id, timeout=1200, interval=3, progress_cb=None, ws=None):
                                 if maximum:
                                     progress_cb(value, maximum, data.get('node'))
                             elif event_type == 'execution_error':
+                                if stop_deferred:
+                                    return None, "__AIX_STOPPED__:当前步骤已结束，项目已停止"
                                 return None, f"ComfyUI执行错误: {data.get('exception_message') or data.get('exception_type') or '未知错误'}"
                 except websocket.WebSocketTimeoutException:
                     pass
@@ -870,11 +959,24 @@ def comfy_wait(prompt_id, timeout=1200, interval=3, progress_cb=None, ws=None):
                         if prompt_id in h:
                             st = h[prompt_id].get('status', {})
                             if st.get('status_str') == 'error':
+                                if stop_deferred:
+                                    return None, "__AIX_STOPPED__:当前步骤已结束，项目已停止"
                                 return None, f"ComfyUI执行错误: {json.dumps(st.get('messages', []), ensure_ascii=False)[:300]}"
+                    if cancel_requested:
+                        queue_response = requests.get(f"{comfy_url()}/queue", timeout=5)
+                        queue_response.raise_for_status()
+                        if _comfy_queue_prompt_state(queue_response.json(), prompt_id) is None:
+                            cancel_left_queue_at = cancel_left_queue_at or time.monotonic()
+                            if time.monotonic() - cancel_left_queue_at >= 3:
+                                return None, "__AIX_STOPPED__:ComfyUI 已结束当前项目任务"
+                        else:
+                            cancel_left_queue_at = None
                 except Exception as e:
                     print(f"[ComfyUI] 轮询异常: {e}")
             if ws is None:
                 time.sleep(min(interval, 1))
+        if stop_deferred:
+            return None, "__AIX_STOPPED__:停止请求已保存；当前 ComfyUI 步骤仍在收尾"
         return None, f"ComfyUI生成超时({timeout}秒)"
     finally:
         if ws is not None:
@@ -954,7 +1056,8 @@ def load_t2i_workflow():
     with open(os.path.join(WORKFLOWS_DIR, 't2i_qwen2512.json'), 'r', encoding='utf-8') as f:
         return json.load(f)
 
-def gen_image(prompt, width=None, height=None, seed=None, save_name=None, progress_cb=None):
+def gen_image(prompt, width=None, height=None, seed=None, save_name=None, progress_cb=None,
+              project_pid=None, run_id=None):
     """千问2512生成参考图，返回本地保存路径。尺寸默认跟随全局画幅设置"""
     t2i = load_t2i_workflow()
     wf = copy.deepcopy(t2i['json'])
@@ -971,14 +1074,40 @@ def gen_image(prompt, width=None, height=None, seed=None, save_name=None, progre
         width, height = ASPECT_IMG_SIZE.get(CONFIG.get('aspect_ratio', '16:9 (Widescreen)'), (1280, 720))
     wf[mp['width'][0]]['inputs'][mp['width'][1]] = width
     wf[mp['height'][0]]['inputs'][mp['height'][1]] = height
+    if project_pid and run_id:
+        raise_if_project_stopped(project_pid, run_id)
     client_id = uuid.uuid4().hex
     ws = None
     try:
         ws = comfy_open_ws(client_id)
     except Exception as e:
         print(f"[ComfyUI] 图像进度通道连接失败，继续使用历史轮询: {e}")
-    pid = comfy_submit(wf, client_id=client_id)
-    history, err = comfy_wait(pid, timeout=1800, progress_cb=progress_cb, ws=ws)
+    registered = False
+    try:
+        pid = comfy_submit(wf, client_id=client_id)
+        if project_pid and run_id:
+            registered = bool(register_project_prompt(project_pid, run_id, pid, 'image'))
+            if not registered:
+                comfy_cancel_prompt_safely(pid)
+                raise ProjectStopRequested('任务归属已变化，旧图片任务已停止')
+        history, err = comfy_wait(
+            pid, timeout=1800, progress_cb=progress_cb, ws=ws,
+            stop_check=(lambda: project_stop_requested(project_pid, run_id)) if project_pid and run_id else None,
+            stop_handler=(lambda prompt_id: cancel_owned_project_prompt(
+                project_pid, run_id, prompt_id)) if project_pid and run_id else None)
+    finally:
+        try:
+            if registered:
+                clear_project_prompt(project_pid, run_id, pid)
+        finally:
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+    stopped = production_stop_message(err)
+    if stopped is not None:
+        raise ProjectStopRequested(stopped)
     if err:
         return None, err
     images = []
@@ -1014,7 +1143,8 @@ def h3_frames_from_duration(seconds):
     frames = max(5, round(seconds * 24))
     return min(362, frames + (5 - frames % 17) % 17)
 
-def gen_video_r2v(prompt, ref_image_paths, duration=None, seed=None, save_name=None, progress_cb=None, preserve_prompt=False):
+def gen_video_r2v(prompt, ref_image_paths, duration=None, seed=None, save_name=None,
+                  progress_cb=None, preserve_prompt=False, project_pid=None, run_id=None):
     """MiniMax H3 r2v生成视频。ref_image_paths[0]=Picture 1(角色), [1]=Picture 2(场景)..."""
     wf = copy.deepcopy(load_r2v_workflow())
     apply_h3_model(wf, 'r2v')
@@ -1068,17 +1198,43 @@ def gen_video_r2v(prompt, ref_image_paths, duration=None, seed=None, save_name=N
     err = None
     attempts = 2 if CONFIG.get('h3_oom_retry', True) else 1
     for attempt in range(attempts):
+        if project_pid and run_id:
+            raise_if_project_stopped(project_pid, run_id)
         client_id = uuid.uuid4().hex
         ws = None
         try:
             ws = comfy_open_ws(client_id)
         except Exception as e:
             print(f"[ComfyUI] 视频进度通道连接失败，继续使用历史轮询: {e}")
+        registered = False
         try:
-            pid = comfy_submit(wf, client_id=client_id)
-        except Exception as exc:
-            return None, str(exc)
-        history, err = comfy_wait(pid, timeout=1800, interval=5, progress_cb=progress_cb, ws=ws)
+            try:
+                pid = comfy_submit(wf, client_id=client_id)
+            except Exception as exc:
+                return None, str(exc)
+            if project_pid and run_id:
+                registered = bool(register_project_prompt(project_pid, run_id, pid, 'video'))
+                if not registered:
+                    comfy_cancel_prompt_safely(pid)
+                    raise ProjectStopRequested('任务归属已变化，旧视频任务已停止')
+            history, err = comfy_wait(
+                pid, timeout=1800, interval=5, progress_cb=progress_cb, ws=ws,
+                stop_check=(lambda: project_stop_requested(project_pid, run_id)) if project_pid and run_id else None,
+                stop_handler=(lambda prompt_id: cancel_owned_project_prompt(
+                    project_pid, run_id, prompt_id)) if project_pid and run_id else None)
+        finally:
+            try:
+                if registered:
+                    clear_project_prompt(project_pid, run_id, pid)
+            finally:
+                if ws is not None:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+        stopped = production_stop_message(err)
+        if stopped is not None:
+            raise ProjectStopRequested(stopped)
         if not err:
             break
         if attempt + 1 >= attempts or not is_comfy_oom(err):
@@ -1466,7 +1622,7 @@ def validate_h3_production_prompt(content, dialogue_lines, ref_count, include_wa
     return list(dict.fromkeys(result))
 
 def repair_h3_production_prompt(sys_text, user_content, content, issues,
-                                dialogue_lines, ref_count):
+                                dialogue_lines, ref_count, stop_check=None):
     """格式不合格时低温重编译一次；仍不合格则拒绝把污染提示词送入H3。"""
     issue_text = "\n".join(f"- {item}" for item in issues)
     repair_request = (
@@ -1476,12 +1632,14 @@ def repair_h3_production_prompt(sys_text, user_content, content, issues,
         "speaker/XML tag, screenplay name-colon line, dialogue repetition, and pause direction. "
         "Return only the complete corrected prompt in the required six-section order."
     )
+    if stop_check and stop_check():
+        raise ProjectStopRequested('当前项目已收到停止请求')
     fixed, err = llm_chat([
         {"role": "system", "content": sys_text},
         {"role": "user", "content": user_content},
         {"role": "assistant", "content": content},
         {"role": "user", "content": repair_request}
-    ], max_tokens=3000, temperature=0.2)
+    ], max_tokens=3000, temperature=0.2, stop_check=stop_check)
     if not fixed:
         return None, err or "提示词格式修复无返回"
     fixed = fixed.strip()
@@ -1781,7 +1939,7 @@ def character_ref_paths_for_prompt(shot, assets):
     return paths
 
 def gen_shot_h3_prompt(shot, ref_paths=None, storyboard_ref_index=None, character_profiles=None,
-                       continuity_ref_index=None):
+                       continuity_ref_index=None, stop_check=None):
     """用LLM为一个剧情片段编写含多个内部Shot的H3提示词。返回(prompt, err)。
     Picture编号规则与实际渲染时的ref_paths组装顺序严格一致（每片上限9张）：
     全部出场角色（四宫格三视图）→ 场景 → 道具，按顺序编号"""
@@ -1849,9 +2007,11 @@ def gen_shot_h3_prompt(shot, ref_paths=None, storyboard_ref_index=None, characte
     content, err = llm_chat([
         {"role": "system", "content": sys_text},
         {"role": "user", "content": user_content}
-    ], max_tokens=3000, temperature=0.35)
+    ], max_tokens=3000, temperature=0.35, stop_check=stop_check)
     if not content:
         return None, err
+    if stop_check and stop_check():
+        raise ProjectStopRequested('当前项目已收到停止请求')
     content = repair_prompt_dialogue_placement(content.strip(), shot)
     issues = validate_h3_production_prompt(
         content, dialogue_lines, len(refs_desc_lines))
@@ -1863,7 +2023,8 @@ def gen_shot_h3_prompt(shot, ref_paths=None, storyboard_ref_index=None, characte
     if issues:
         print(f"[H3提示词] 格式不合格，触发低温重编译: {issues}")
         content, repair_err = repair_h3_production_prompt(
-            sys_text, user_content, content, issues, dialogue_lines, len(refs_desc_lines))
+            sys_text, user_content, content, issues, dialogue_lines, len(refs_desc_lines),
+            stop_check=stop_check)
         if not content:
             return None, repair_err
     return content, None
@@ -1961,9 +2122,31 @@ def describe_uploaded_asset(img_path, kind, name):
 def project_path(pid):
     return os.path.join(PROJECTS_DIR, f"{pid}.json")
 
-def save_project(proj):
+def save_project(proj, preserve_runtime=True):
     target = project_path(proj['id'])
     with _PROJECT_IO_LOCK:
+        # The pipeline keeps a project object in memory for a long time. Preserve
+        # a newer stop request written by the API instead of overwriting it with
+        # that stale snapshot during a later progress save.
+        incoming_job = proj.get('production_job')
+        if preserve_runtime and os.path.exists(target):
+            try:
+                with open(target, 'r', encoding='utf-8') as stream:
+                    stored_job = (json.load(stream) or {}).get('production_job')
+                stored_updated = float((stored_job or {}).get('updated') or 0)
+                incoming_updated = float((incoming_job or {}).get('updated') or 0)
+                equal_terminal_wins = (
+                    stored_updated == incoming_updated
+                    and (stored_job or {}).get('status') in TERMINAL_PRODUCTION_STATUSES
+                    and (incoming_job or {}).get('status') in ACTIVE_PRODUCTION_STATUSES)
+                if (stored_job and (not incoming_job
+                        or (stored_job.get('run_id') == incoming_job.get('run_id')
+                            and stored_job.get('stop_requested') and not incoming_job.get('stop_requested'))
+                        or stored_updated > incoming_updated
+                        or equal_terminal_wins)):
+                    proj['production_job'] = copy.deepcopy(stored_job)
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
         last_error = None
         for attempt in range(5):
             temp = f"{target}.{uuid.uuid4().hex}.tmp"
@@ -2006,6 +2189,177 @@ def load_project(pid):
                     raise
                 time.sleep(0.04 * (attempt + 1))
     return None
+
+class ProjectStopRequested(RuntimeError):
+    pass
+
+class ProjectAlreadyRunning(RuntimeError):
+    pass
+
+def production_job_active(job):
+    return str((job or {}).get('status') or '') in ACTIVE_PRODUCTION_STATUSES
+
+def request_project_stop_state(pid, requested_run_id=None):
+    """Compare-and-set one project run to stopping without racing its terminal write."""
+    with _PROJECT_IO_LOCK:
+        proj = load_project(pid)
+        if not proj:
+            return 'missing', None, None
+        job = proj.get('production_job') or {}
+        if requested_run_id and requested_run_id != str(job.get('run_id') or ''):
+            return 'stale', copy.deepcopy(job), None
+        status = str(job.get('status') or '')
+        if status == 'stopping':
+            return 'stopping', copy.deepcopy(job), job.get('current_prompt_id')
+        if not production_job_active(job) or proj.get('final'):
+            return 'terminal', copy.deepcopy(job), None
+        now = time.time()
+        job.update({
+            'status': 'stopping', 'stop_requested': True,
+            'message': '停止请求已保存，将保留已经完成的结果',
+            'stop_requested_at': now, 'updated': now,
+        })
+        proj['production_job'] = job
+        save_project(proj, preserve_runtime=False)
+        return 'accepted', copy.deepcopy(job), job.get('current_prompt_id')
+
+def update_stopping_cancel_result(pid, run_id, action, message):
+    with _PROJECT_IO_LOCK:
+        proj = load_project(pid)
+        if not proj:
+            return None
+        job = proj.get('production_job') or {}
+        if job.get('run_id') == run_id and job.get('status') == 'stopping':
+            job.update({'cancel_result': action, 'message': message, 'updated': time.time()})
+            proj['production_job'] = job
+            save_project(proj, preserve_runtime=False)
+        return copy.deepcopy(job)
+
+def begin_production_job(pid, kind):
+    run_id = uuid.uuid4().hex
+    if not claim_project_job(pid, run_id):
+        raise ProjectAlreadyRunning('当前项目已有生成任务正在运行')
+    try:
+        proj = load_project(pid)
+        if not proj:
+            release_project_job(pid, run_id)
+            return None
+        now = time.time()
+        proj['production_job'] = {
+            'run_id': run_id, 'kind': kind, 'status': 'running',
+            'stop_requested': False, 'current_prompt_id': None,
+            'current_prompt_kind': None, 'cancel_result': None,
+            'message': '任务正在运行', 'started': now, 'updated': now,
+        }
+        save_project(proj, preserve_runtime=False)
+        return run_id
+    except Exception:
+        release_project_job(pid, run_id)
+        raise
+
+def end_production_job(pid, run_id):
+    release_project_job(pid, run_id)
+
+def update_production_job(pid, run_id=None, **changes):
+    """Atomically update persisted runtime ownership for one project run."""
+    with _PROJECT_IO_LOCK:
+        proj = load_project(pid)
+        if not proj:
+            return None
+        job = proj.get('production_job') or {}
+        if run_id and job.get('run_id') != run_id:
+            return None
+        job.update(changes)
+        job['updated'] = time.time()
+        proj['production_job'] = job
+        save_project(proj, preserve_runtime=False)
+        return copy.deepcopy(job)
+
+def project_stop_requested(pid, run_id=None):
+    proj = load_project(pid)
+    job = (proj or {}).get('production_job') or {}
+    if run_id and job.get('run_id') != run_id:
+        return True
+    return bool(job.get('stop_requested'))
+
+def raise_if_project_stopped(pid, run_id):
+    if project_stop_requested(pid, run_id):
+        raise ProjectStopRequested('当前项目已收到停止请求')
+
+def register_project_prompt(pid, run_id, prompt_id, kind):
+    return update_production_job(
+        pid, run_id, current_prompt_id=str(prompt_id), current_prompt_kind=kind,
+        status='stopping' if project_stop_requested(pid, run_id) else 'running')
+
+def clear_project_prompt(pid, run_id, prompt_id):
+    proj = load_project(pid)
+    job = (proj or {}).get('production_job') or {}
+    if job.get('run_id') == run_id and str(job.get('current_prompt_id') or '') == str(prompt_id):
+        update_production_job(pid, run_id, current_prompt_id=None, current_prompt_kind=None)
+
+def production_stop_message(error):
+    text = str(error or '')
+    return text.split(':', 1)[1] if text.startswith('__AIX_STOPPED__:') else None
+
+def cancel_owned_project_prompt(pid, run_id, prompt_id):
+    proj = load_project(pid)
+    job = (proj or {}).get('production_job') or {}
+    if job.get('run_id') != run_id or str(job.get('current_prompt_id') or '') != str(prompt_id):
+        return 'none', '当前提示已不属于这个项目任务'
+    if job.get('cancel_result') == 'cancelled':
+        return 'cancelled', job.get('message') or '当前项目任务已取消'
+    action, message = comfy_cancel_prompt_safely(prompt_id)
+    update_production_job(pid, run_id, cancel_result=action, message=message)
+    return action, message
+
+def finalize_project_stopped(pid, run_id, message):
+    """Persist a stopped terminal state while leaving completed outputs untouched."""
+    with _PROJECT_IO_LOCK:
+        proj = load_project(pid)
+        if not proj:
+            return None
+        job = proj.get('production_job') or {}
+        if job.get('run_id') != run_id:
+            return None
+        active_states = {'queued', 'prompting', 'generating', 'retrying', 'running', 'stopping'}
+        for group in (proj.get('item_states') or {}).values():
+            if not isinstance(group, dict):
+                continue
+            for item in group.values():
+                if isinstance(item, dict) and item.get('status') in active_states:
+                    item.update({'status': 'waiting', 'message': '任务已停止，可从断点继续', 'updated': time.time()})
+        prep = proj.get('preproduction') or {}
+        for item in prep.get('asset_plan', []):
+            if item.get('status') in active_states:
+                item.update({'status': 'waiting', 'message': '任务已停止，可重新生成', 'updated': time.time()})
+        batch = prep.get('asset_batch') or {}
+        if batch.get('status') in ('starting', 'running', 'stopping'):
+            batch.update({'status': 'stopped', 'current': None, 'message': message, 'updated': time.time()})
+        job.update({
+            'status': 'stopped', 'stop_requested': True,
+            'current_prompt_id': None, 'current_prompt_kind': None,
+            'message': message, 'stopped': time.time(), 'updated': time.time(),
+        })
+        proj['production_job'] = job
+        save_project(proj, preserve_runtime=False)
+        return copy.deepcopy(job)
+
+def finish_preproduction_llm_job(pid, run_id, status, message):
+    """Finish one synchronous preparation call without overwriting a pending stop."""
+    with _PROJECT_IO_LOCK:
+        proj = load_project(pid)
+        if not proj:
+            return None
+        job = proj.get('production_job') or {}
+        if job.get('run_id') != run_id:
+            return copy.deepcopy(job)
+        if status == 'stopped' or job.get('stop_requested'):
+            return finalize_project_stopped(
+                pid, run_id, message or '已停止，完成的结果已保留')
+        return update_production_job(
+            pid, run_id, status=status, message=message,
+            current_prompt_id=None, current_prompt_kind=None,
+            finished=time.time())
 
 def app_version():
     version_path = os.path.join(BASE_DIR, 'VERSION')
@@ -2472,7 +2826,7 @@ def build_manual_h3_script(prompt, extracted, timeline):
     }
     return script, timeline['prompts']
 
-def update_production_job(proj, status, message='', **extra):
+def set_production_job_status(proj, status, message='', **extra):
     job = proj.setdefault('production_job', {})
     job.update({'status': status, 'message': message, 'updated': time.time(), **extra})
     return job
@@ -2486,7 +2840,7 @@ def project_missing_shot_indexes(proj):
     }
     return sorted(required - completed)
 
-def generate_project_shot(proj, shot_position, send):
+def generate_project_shot(proj, shot_position, send, run_id=None):
     """Generate one project segment from persisted script, prompt, assets and continuity."""
     script = proj.get('script') or {}
     shots = script.get('shots') or []
@@ -2579,10 +2933,12 @@ def generate_project_shot(proj, shot_position, send):
         "prompt": h3_prompt, "generation_started_at": generation_started_at})
     progress_cb = make_progress_publisher(
         proj, send, 'shots', idx, None, label, 'H3片段正在采样', start=10, end=95)
+    raise_if_project_stopped(pid, run_id)
     video_info, video_error = gen_video_r2v(
         h3_prompt, ref_paths, duration=shot.get('duration', 8),
         save_name=f"shot_{idx:02d}.mp4", progress_cb=progress_cb,
-        preserve_prompt=(proj.get('input_mode') == 'h3_prompt'))
+        preserve_prompt=(proj.get('input_mode') == 'h3_prompt'),
+        project_pid=pid, run_id=run_id)
     if video_info is None:
         elapsed = round(time.time() - generation_started_at, 1)
         message = video_error or '视频生成失败'
@@ -2615,19 +2971,20 @@ def generate_project_shot(proj, shot_position, send):
         'generation_started_at', 'generation_elapsed_seconds')})
     return result, None
 
-def finalize_project_video(proj, send):
+def finalize_project_video(proj, send, run_id=None):
     """Compose completed segments while keeping finalization errors separate from shot status."""
     missing = project_missing_shot_indexes(proj)
     if missing:
         return False, f"仍有{len(missing)}个片段待生成"
-    update_production_job(proj, 'merging', '正在合并所有片段', stage='finalizing')
+    raise_if_project_stopped(proj['id'], run_id)
+    set_production_job_status(proj, 'merging', '正在合并所有片段', stage='finalizing')
     save_project(proj)
     send('stage', {"stage": 4, "name": "视频合成", "status": "running", "msg": "正在合并所有片段..."})
     try:
         ffmpeg = find_ffmpeg()
         if not ffmpeg:
             message = "未检测到ffmpeg（整合包tools/ffmpeg与系统PATH均无）"
-            update_production_job(proj, 'failed', message, stage='finalizing')
+            set_production_job_status(proj, 'failed', message, stage='finalizing')
             save_project(proj)
             send('error', {"stage": 4, "msg": message})
             return False, message
@@ -2640,30 +2997,34 @@ def finalize_project_video(proj, send):
         proc = subprocess.run(
             [ffmpeg, '-y', '-f', 'concat', '-safe', '0', '-i', 'concat.txt', '-c', 'copy', 'final.mp4'],
             cwd=out_dir, capture_output=True, text=True, timeout=300)
+        raise_if_project_stopped(proj['id'], run_id)
         if proc.returncode != 0:
             proc = subprocess.run(
                 [ffmpeg, '-y', '-f', 'concat', '-safe', '0', '-i', 'concat.txt', '-c:v', 'libx264', '-c:a', 'aac', 'final.mp4'],
                 cwd=out_dir, capture_output=True, text=True, timeout=600)
+            raise_if_project_stopped(proj['id'], run_id)
         if proc.returncode != 0:
             message = f"ffmpeg合并失败: {proc.stderr[-300:]}"
-            update_production_job(proj, 'failed', message, stage='finalizing')
+            set_production_job_status(proj, 'failed', message, stage='finalizing')
             save_project(proj)
             send('error', {"stage": 4, "msg": message})
             return False, message
+    except ProjectStopRequested:
+        raise
     except Exception as exc:
         message = f"ffmpeg执行异常: {exc}"
-        update_production_job(proj, 'failed', message, stage='finalizing')
+        set_production_job_status(proj, 'failed', message, stage='finalizing')
         save_project(proj)
         send('error', {"stage": 4, "msg": message})
         return False, message
     proj['final'] = f"/file/outputs/{proj['id']}/final.mp4"
-    update_production_job(proj, 'done', '成片已生成', stage='complete')
+    set_production_job_status(proj, 'done', '成片已生成', stage='complete')
     save_project(proj)
     send('stage', {"stage": 4, "name": "视频合成", "status": "done"})
     send('final', {"video_url": proj['final'], "title": proj.get('title', '短剧')})
     return True, None
 
-def run_pipeline(pid, idea, send, custom_assets=False, input_mode='story'):
+def _run_pipeline(pid, idea, send, custom_assets=False, input_mode='story', run_id=None):
     """完整短剧生成管线，send(event, data)推送进度"""
     proj = load_project(pid)
     if proj is None:
@@ -2678,8 +3039,9 @@ def run_pipeline(pid, idea, send, custom_assets=False, input_mode='story'):
             idea = proj.get('manual_h3_prompt') or proj.get('idea') or idea
     if custom_assets:
         proj['custom_assets'] = True
-    update_production_job(proj, 'running', '正在生成短剧', stage='production')
+    set_production_job_status(proj, 'running', '正在生成短剧', stage='production')
     save_project(proj)
+    raise_if_project_stopped(pid, run_id)
     out_dir = os.path.join(OUTPUTS_DIR, pid)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -2708,6 +3070,7 @@ def run_pipeline(pid, idea, send, custom_assets=False, input_mode='story'):
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": idea}
         ], max_tokens=3000 if manual_mode else 8000, temperature=0.2 if manual_mode else 0.75)
+        raise_if_project_stopped(pid, run_id)
         if not content:
             send('error', {"stage": 1, "msg": f"剧本生成失败: {err}"})
             return
@@ -2726,6 +3089,7 @@ def run_pipeline(pid, idea, send, custom_assets=False, input_mode='story'):
                 {"role": "assistant", "content": content},
                 {"role": "user", "content": f"片段数量不对：你给了{len(script['shots'])}个，必须恰好{want_count}个生产片段。请重新输出完整JSON（shots兼容数组中严格{want_count}项）。直接输出JSON，不要解释。"}
             ], max_tokens=8000, temperature=0.6)
+            raise_if_project_stopped(pid, run_id)
             if content2:
                 script2 = parse_json_from_text(content2)
                 if script2 and script2.get('shots'):
@@ -2802,6 +3166,7 @@ def run_pipeline(pid, idea, send, custom_assets=False, input_mode='story'):
         wait_start = time.time()
         while True:
             time.sleep(2)
+            raise_if_project_stopped(pid, run_id)
             fresh = load_project(pid)
             if fresh and fresh.get('assets_confirmed'):
                 proj = fresh
@@ -2843,6 +3208,7 @@ def run_pipeline(pid, idea, send, custom_assets=False, input_mode='story'):
                 return
             prompt_errors = []
             for i, shot in todo:
+                raise_if_project_stopped(pid, run_id)
                 idx = shot.get('index', i + 1)
                 label = segment_label(shot, idx)
                 continuity_needed = i > 0 and segment_needs_previous_tail(shot)
@@ -2891,6 +3257,7 @@ def run_pipeline(pid, idea, send, custom_assets=False, input_mode='story'):
             send('error', {"stage": 2, "msg": preflight_error})
             return
     for c in characters:
+        raise_if_project_stopped(pid, run_id)
         key = f"char_{c['name']}"
         if key in assets and os.path.exists(assets[key].get('path', '')):
             done_count += 1
@@ -2905,7 +3272,7 @@ def run_pipeline(pid, idea, send, custom_assets=False, input_mode='story'):
                   f"四个分格中角色的脸型、发型、服装、体型、肤色必须完全一致，纯色素净背景，站姿端正，画质精美，细节丰富。")
         publish_item_state(proj, send, 'assets', key, 'generating', 3, '正在加载模型并生成角色图', 'character', c['name'])
         progress_cb = make_progress_publisher(proj, send, 'assets', key, 'character', c['name'], '角色图正在采样')
-        path, err = gen_image(prompt, progress_cb=progress_cb)
+        path, err = gen_image(prompt, progress_cb=progress_cb, project_pid=pid, run_id=run_id)
         if err:
             publish_item_state(proj, send, 'assets', key, 'failed', 0, err, 'character', c['name'])
             send('error', {"stage": 2, "msg": f"角色[{c['name']}]参考图生成失败: {err}"})
@@ -2917,6 +3284,7 @@ def run_pipeline(pid, idea, send, custom_assets=False, input_mode='story'):
         send('asset', {"type": "character", "name": c['name'], "url": f"/file/assets/{os.path.basename(path)}"})
         send('progress', {"stage": 2, "done": done_count, "total": total_assets})
     for s in scenes:
+        raise_if_project_stopped(pid, run_id)
         key = f"scene_{s['name']}"
         if key in assets and os.path.exists(assets[key].get('path', '')):
             done_count += 1
@@ -2932,7 +3300,7 @@ def run_pipeline(pid, idea, send, custom_assets=False, input_mode='story'):
         mode_label = '真实取景' if scene_mode == 'photo' else '概念设定'
         publish_item_state(proj, send, 'assets', key, 'generating', 3, f'正在生成{mode_label}场景图', 'scene', s['name'])
         progress_cb = make_progress_publisher(proj, send, 'assets', key, 'scene', s['name'], f'{mode_label}场景图正在采样')
-        path, err = gen_image(prompt, progress_cb=progress_cb)
+        path, err = gen_image(prompt, progress_cb=progress_cb, project_pid=pid, run_id=run_id)
         if err:
             publish_item_state(proj, send, 'assets', key, 'failed', 0, err, 'scene', s['name'])
             send('error', {"stage": 2, "msg": f"场景[{s['name']}]参考图生成失败: {err}"})
@@ -2944,6 +3312,7 @@ def run_pipeline(pid, idea, send, custom_assets=False, input_mode='story'):
         send('asset', {"type": "scene", "name": s['name'], "url": f"/file/assets/{os.path.basename(path)}"})
         send('progress', {"stage": 2, "done": done_count, "total": total_assets})
     for p in props:
+        raise_if_project_stopped(pid, run_id)
         key = f"prop_{p['name']}"
         if key in assets and os.path.exists(assets[key].get('path', '')):
             done_count += 1
@@ -2953,7 +3322,7 @@ def run_pipeline(pid, idea, send, custom_assets=False, input_mode='story'):
         prompt = f"{style}风格，关键道具特写参考图（无人物）。{p['description']}。纯色素净背景，道具居中完整展示，材质纹理细节清晰，画质精美。"
         publish_item_state(proj, send, 'assets', key, 'generating', 3, '正在加载模型并生成道具图', 'prop', p['name'])
         progress_cb = make_progress_publisher(proj, send, 'assets', key, 'prop', p['name'], '道具图正在采样')
-        path, err = gen_image(prompt, progress_cb=progress_cb)
+        path, err = gen_image(prompt, progress_cb=progress_cb, project_pid=pid, run_id=run_id)
         if err:
             publish_item_state(proj, send, 'assets', key, 'failed', 0, err, 'prop', p['name'])
             send('error', {"stage": 2, "msg": f"道具[{p['name']}]参考图生成失败: {err}"})
@@ -2969,9 +3338,10 @@ def run_pipeline(pid, idea, send, custom_assets=False, input_mode='story'):
     # ---------- 阶段3：片段视频生成 ----------
     send('stage', {"stage": 3, "name": "片段视频", "status": "running", "msg": "正在逐片生成视频..."})
     for position, _shot in enumerate(shots):
-        _result, error = generate_project_shot(proj, position, send)
+        raise_if_project_stopped(pid, run_id)
+        _result, error = generate_project_shot(proj, position, send, run_id=run_id)
         if error:
-            update_production_job(proj, 'failed', error, stage='production')
+            set_production_job_status(proj, 'failed', error, stage='production')
             save_project(proj)
             return
         send('progress', {
@@ -2982,7 +3352,67 @@ def run_pipeline(pid, idea, send, custom_assets=False, input_mode='story'):
     send('stage', {"stage": 3, "name": "片段视频", "status": "done"})
 
     # ---------- 阶段4：视频合成 ----------
-    finalize_project_video(proj, send)
+    raise_if_project_stopped(pid, run_id)
+    finalize_project_video(proj, send, run_id=run_id)
+
+def _run_pipeline_job(pid, idea, send, run_id, custom_assets=False, input_mode='story'):
+    """Run one persisted project job and converge every exit to a terminal state."""
+    send('job_status', {'run_id': run_id, 'status': 'running', 'message': '项目生成已开始'})
+    try:
+        _run_pipeline(pid, idea, send, custom_assets=custom_assets,
+                      input_mode=input_mode, run_id=run_id)
+    except ProjectStopRequested as exc:
+        message = str(exc) or '已停止，完成的结果已保留'
+        finalize_project_stopped(pid, run_id, message)
+        send('job_status', {'status': 'stopped', 'message': message})
+        end_production_job(pid, run_id)
+        return
+    except Exception:
+        update_production_job(pid, run_id, status='failed', message='任务异常结束，可从断点继续', finished=time.time())
+        end_production_job(pid, run_id)
+        raise
+    proj = load_project(pid) or {}
+    job = proj.get('production_job') or {}
+    if job.get('run_id') != run_id:
+        end_production_job(pid, run_id)
+        return
+    if proj.get('final'):
+        message = ('停止请求到达时项目已完成' if job.get('stop_requested') else '项目制作完成')
+        update_production_job(pid, run_id, status='done', message=message, finished=time.time())
+        send('job_status', {'status': 'done', 'message': message})
+    elif job.get('stop_requested'):
+        message = job.get('message') or '已停止，完成的结果已保留'
+        finalize_project_stopped(pid, run_id, message)
+        send('job_status', {'status': 'stopped', 'message': message})
+    elif job.get('status') == 'failed':
+        message = job.get('message') or '任务已结束，可从断点继续'
+        update_production_job(pid, run_id, finished=time.time())
+        send('job_status', {'status': 'failed', 'message': message})
+    else:
+        update_production_job(pid, run_id, status='failed', message='任务已结束，可从断点继续', finished=time.time())
+        send('job_status', {'status': 'failed', 'message': '任务已结束，可从断点继续'})
+    end_production_job(pid, run_id)
+
+def run_pipeline(pid, idea, send, custom_assets=False, input_mode='story'):
+    run_id = None
+    try:
+        run_id = begin_production_job(pid, 'pipeline')
+        if not run_id:
+            # New projects are created inside the legacy pipeline, so seed the shell first.
+            save_project({
+                'id': pid, 'idea': idea, 'input_mode': input_mode, 'title': '',
+                'script': None, 'assets': {}, 'shots': [], 'final': None,
+                'created': time.time(),
+                'scene_reference_mode': resolve_scene_reference_mode(
+                    CONFIG.get('style'), CONFIG.get('scene_reference_mode')),
+                **({'manual_h3_prompt': idea} if input_mode == 'h3_prompt' else {}),
+            })
+            run_id = begin_production_job(pid, 'pipeline')
+        return _run_pipeline_job(
+            pid, idea, send, run_id, custom_assets=custom_assets, input_mode=input_mode)
+    finally:
+        if run_id:
+            end_production_job(pid, run_id)
 
 # ============================== 单镜头生成器 API ==============================
 @app.route('/api/single_shot/upload', methods=['POST'])
@@ -3090,30 +3520,44 @@ def single_shot_status(task_id):
 def recover_interrupted_shot_retries(proj):
     """Recover persisted production state only when no process still owns this project."""
     pid = proj.get('id')
-    states = (proj.get('item_states') or {}).get('shots') or {}
-    interrupted = [
-        state for state in states.values()
-        if state.get('retry_count') and state.get('status') in ('retrying', 'prompting', 'generating')
-    ]
-    production_job = proj.get('production_job') or {}
-    job_status = production_job.get('status')
-    if (not interrupted and job_status not in ACTIVE_PRODUCTION_STATUSES) or project_job_active(pid):
+    recovery_id = f"recovery-{uuid.uuid4().hex}"
+    if not pid or not claim_project_job(pid, recovery_id):
         return False
-    message = ("服务重启导致视频合成中断，可从断点继续"
-               if job_status == 'merging'
-               else "服务重启导致生成任务中断，可继续生成")
-    for state in states.values():
-        if not state.get('retry_count') or state.get('status') not in ('retrying', 'prompting', 'generating'):
-            continue
-        message = "服务重启导致片段重试中断，可再次重新生成"
-        state.update({
-            'status': 'failed', 'progress': 0, 'message': message,
-            'error': message, 'updated': time.time(),
-        })
-    stage = production_job.get('stage') or ('finalizing' if job_status == 'merging' else 'production')
-    update_production_job(proj, 'failed', message, stage=stage)
-    save_project(proj)
-    return True
+    try:
+        current = load_project(pid)
+        if not current:
+            return False
+        states = (current.get('item_states') or {}).get('shots') or {}
+        interrupted = [
+            state for state in states.values()
+            if state.get('retry_count') and state.get('status') in ('retrying', 'prompting', 'generating')
+        ]
+        production_job = current.get('production_job') or {}
+        job_status = production_job.get('status')
+        if not interrupted and job_status not in ACTIVE_PRODUCTION_STATUSES:
+            return False
+        if job_status == 'stopping':
+            finalize_project_stopped(
+                pid, production_job.get('run_id'),
+                production_job.get('message') or '项目已经安全停止，完成的结果已保留')
+            return True
+        message = ("服务重启导致视频合成中断，可从断点继续"
+                   if job_status == 'merging'
+                   else "服务重启导致生成任务中断，可继续生成")
+        for state in states.values():
+            if not state.get('retry_count') or state.get('status') not in ('retrying', 'prompting', 'generating'):
+                continue
+            message = "服务重启导致片段重试中断，可再次重新生成"
+            state.update({
+                'status': 'failed', 'progress': 0, 'message': message,
+                'error': message, 'updated': time.time(),
+            })
+        stage = production_job.get('stage') or ('finalizing' if job_status == 'merging' else 'production')
+        set_production_job_status(current, 'failed', message, stage=stage)
+        save_project(current)
+        return True
+    finally:
+        release_project_job(pid, recovery_id)
 
 def run_project_shot_retry(pid, index, job_id):
     """Retry exactly one failed project segment and leave every completed segment untouched."""
@@ -3126,23 +3570,36 @@ def run_project_shot_retry(pid, index, job_id):
             project, 'shots', index, 'failed', 0, message,
             name=state.get('name') or segment_label(planned_shot, index),
         )
-        update_production_job(project, 'failed', message, stage='production')
+        set_production_job_status(project, 'failed', message, stage='production')
         save_project(project)
 
     try:
         proj = load_project(pid)
         if not proj:
             return
+        current_job = proj.get('production_job') or {}
+        if current_job.get('run_id') != job_id:
+            now = time.time()
+            proj['production_job'] = {
+                'run_id': job_id, 'job_id': job_id, 'kind': 'shot_retry',
+                'status': 'retrying', 'stop_requested': False,
+                'current_prompt_id': None, 'current_prompt_kind': None,
+                'cancel_result': None, 'message': f'片段{index}正在重试',
+                'stage': 'production', 'started': now, 'updated': now,
+            }
+            save_project(proj, preserve_runtime=False)
+        raise_if_project_stopped(pid, job_id)
         shots = (proj.get('script') or {}).get('shots') or []
         position = next((pos for pos, shot in enumerate(shots)
                          if int(shot.get('index', pos + 1)) == index), None)
         if position is None:
-            update_production_job(proj, 'failed', f'片段{index}不存在', stage='production')
+            set_production_job_status(proj, 'failed', f'片段{index}不存在', stage='production')
             save_project(proj)
             return
         planned = shots[position]
 
         if not (proj.get('prompts') or {}).get(str(index)):
+            raise_if_project_stopped(pid, job_id)
             publish_item_state(
                 proj, capture, 'shots', index, 'prompting', 2,
                 '正在准备片段提示词', name=segment_label(planned, index))
@@ -3171,18 +3628,23 @@ def run_project_shot_retry(pid, index, job_id):
         if not prepare_comfy_stage():
             fail_retry(proj, planned, f"ComfyUI不可用或互斥切换失败: {comfy_url()}")
             return
-        result, error = generate_project_shot(proj, position, capture)
+        raise_if_project_stopped(pid, job_id)
+        result, error = generate_project_shot(proj, position, capture, run_id=job_id)
         if error or not result:
-            update_production_job(proj, 'failed', error or '片段重试未完成', stage='production')
+            set_production_job_status(proj, 'failed', error or '片段重试未完成', stage='production')
             save_project(proj)
             return
         missing = project_missing_shot_indexes(proj)
         if missing:
             message = f"片段{index}重试完成，仍有{len(missing)}个片段待生成"
-            update_production_job(proj, 'done', message, stage='production')
+            set_production_job_status(proj, 'partial', message, stage='production')
             save_project(proj)
             return
-        finalize_project_video(proj, capture)
+        raise_if_project_stopped(pid, job_id)
+        finalize_project_video(proj, capture, run_id=job_id)
+    except ProjectStopRequested as exc:
+        message = str(exc) or '已停止，完成的结果已保留'
+        finalize_project_stopped(pid, job_id, message)
     except Exception as exc:
         print(f"[片段重试] {pid}/{index} 异常: {exc}")
         proj = load_project(pid)
@@ -3194,7 +3656,7 @@ def run_project_shot_retry(pid, index, job_id):
                 set_item_state(
                     proj, 'shots', index, 'failed', 0, '片段重试异常，请查看服务日志',
                     name=state.get('name'))
-            update_production_job(proj, 'failed', '片段重试异常，请查看服务日志', stage='production')
+            set_production_job_status(proj, 'failed', '片段重试异常，请查看服务日志', stage='production')
             save_project(proj)
     finally:
         release_project_job(pid, job_id)
@@ -3206,7 +3668,8 @@ def project_shot_retry(pid, index):
     proj = load_project(pid)
     if not proj:
         return jsonify({"ok": False, "msg": "项目不存在"}), 404
-    recover_interrupted_shot_retries(proj)
+    if recover_interrupted_shot_retries(proj):
+        proj = load_project(pid) or proj
     planned = next((shot for shot in (proj.get('script') or {}).get('shots', [])
                     if int(shot.get('index', 0) or 0) == index), None)
     if not planned:
@@ -3224,6 +3687,29 @@ def project_shot_retry(pid, index):
     job_id = uuid.uuid4().hex
     if not claim_project_job(pid, job_id):
         return jsonify({"ok": False, "msg": "该项目已有生成任务，请等待当前任务结束"}), 409
+    # Everything checked before the lock is only an optimistic fast path. A
+    # previous retry may have completed between that read and this claim.
+    try:
+        proj = load_project(pid)
+        if not proj:
+            release_project_job(pid, job_id)
+            return jsonify({"ok": False, "msg": "项目不存在"}), 404
+        planned = next((shot for shot in (proj.get('script') or {}).get('shots', [])
+                        if int(shot.get('index', 0) or 0) == index), None)
+        completed = next((shot for shot in proj.get('shots', [])
+                         if shot.get('index') == index and shot.get('video_url')), None)
+        state = (((proj.get('item_states') or {}).get('shots') or {}).get(str(index), {}))
+    except Exception as exc:
+        print(f"[片段重试] {pid}/{index} 加锁后复核失败: {exc}")
+        release_project_job(pid, job_id)
+        return jsonify({"ok": False, "msg": "无法复核片段状态，请重试"}), 500
+    if not planned or completed or state.get('status') != 'failed':
+        release_project_job(pid, job_id)
+        if not planned:
+            return jsonify({"ok": False, "msg": f"片段{index}不存在"}), 404
+        if completed:
+            return jsonify({"ok": False, "msg": f"片段{index}已经生成完成，无需重试"}), 409
+        return jsonify({"ok": False, "msg": f"片段{index}当前不是失败状态"}), 409
     original_error = state.get('original_error') or state.get('error') or state.get('message') or '视频生成失败'
     try:
         try:
@@ -3235,10 +3721,14 @@ def project_shot_retry(pid, index):
             name=state.get('name') or segment_label(planned, index),
             retry_count=retry_count, original_error=original_error,
         )
-        update_production_job(
-            proj, 'retrying', queued['message'], job_id=job_id,
-            kind='shot_retry', shot_index=index, stage='production')
-        save_project(proj)
+        set_production_job_status(
+            proj, 'retrying', queued['message'], run_id=job_id, job_id=job_id,
+            kind='shot_retry', shot_index=index, stage='production',
+            stop_requested=False, current_prompt_id=None,
+            current_prompt_kind=None, cancel_result=None)
+        # The project lock makes this the authoritative start of a new run.
+        # Do not let an equal-timestamp terminal state from the previous run win.
+        save_project(proj, preserve_runtime=False)
         threading.Thread(
             target=run_project_shot_retry, args=(pid, index, job_id), daemon=True).start()
     except Exception as exc:
@@ -3250,7 +3740,7 @@ def project_shot_retry(pid, index):
                 name=state.get('name') or segment_label(planned, index),
                 retry_count=locals().get('retry_count', 1), original_error=original_error,
             )
-            update_production_job(proj, 'failed', failed['message'], stage='production')
+            set_production_job_status(proj, 'failed', failed['message'], stage='production')
             save_project(proj)
         except Exception as save_error:
             print(f"[片段重试] {pid}/{index} 失败状态保存异常: {save_error}")
@@ -3445,12 +3935,7 @@ def api_pipeline_run():
     custom_assets = (request.args.get('custom_assets') == '1')
     if not idea and not load_project(pid):
         return jsonify({"ok": False, "msg": "请输入创作内容"}), 400
-    job_id = uuid.uuid4().hex
     def stream():
-        if not claim_project_job(pid, job_id):
-            yield sse('error', {"msg": "该项目已有生成任务，请等待当前任务结束"})
-            yield sse('end', {})
-            return
         queue = []
         def push(event, data):
             queue.append(sse(event, data))
@@ -3458,28 +3943,18 @@ def api_pipeline_run():
         def worker():
             try:
                 run_pipeline(pid, idea, push, custom_assets=custom_assets, input_mode=input_mode)
+            except ProjectAlreadyRunning as exc:
+                push('error', {"msg": str(exc)})
             except Exception as e:
                 import traceback
                 traceback.print_exc()
                 push('error', {"msg": f"管线异常: {e}"})
             finally:
-                try:
-                    finished = load_project(pid)
-                    if finished and (finished.get('production_job') or {}).get('status') in ACTIVE_PRODUCTION_STATUSES:
-                        message = '生成任务未完成，请查看失败项后继续'
-                        stage = (finished.get('production_job') or {}).get('stage') or 'production'
-                        update_production_job(finished, 'failed', message, stage=stage)
-                        save_project(finished)
-                except Exception as finish_error:
-                    print(f"[生成任务] {pid} 收尾状态保存失败: {finish_error}")
-                finally:
-                    release_project_job(pid, job_id)
-                    push('end', {})
+                push('end', {})
         t = threading.Thread(target=worker, daemon=True)
         try:
             t.start()
         except Exception:
-            release_project_job(pid, job_id)
             yield sse('error', {"msg": "无法启动生成任务，请查看服务日志"})
             yield sse('end', {})
             return
@@ -3495,6 +3970,46 @@ def api_pipeline_run():
             yield queue.pop(0)
     return Response(stream(), mimetype='text/event-stream',
                     headers={'Cache-Control': 'no-cache, no-transform', 'X-Accel-Buffering': 'no', 'Connection': 'keep-alive'})
+
+@app.route('/api/project/<pid>/stop', methods=['POST'])
+def api_stop_project(pid):
+    """Request a cooperative stop and cancel only the prompt owned by this project."""
+    requested_run_id = str((request.get_json(silent=True) or {}).get('run_id') or '').strip()
+    outcome, job, prompt_id = request_project_stop_state(pid, requested_run_id)
+    if outcome == 'missing':
+        return jsonify({'ok': False, 'msg': '项目不存在'}), 404
+    if outcome == 'stale':
+        return jsonify({'ok': False, 'status': job.get('status') or 'idle',
+                        'msg': '任务已经更新，请刷新页面后再操作'}), 409
+    status = str(job.get('status') or '')
+    if outcome == 'stopping':
+        return jsonify({'ok': True, 'changed': False, 'status': 'stopping',
+                        'msg': job.get('message') or '项目正在停止', 'production_job': job})
+    if outcome == 'terminal' and status == 'stopped':
+        return jsonify({'ok': True, 'changed': False, 'status': 'stopped', 'msg': job.get('message') or '项目已经停止'})
+    if outcome == 'terminal' and status in ('done', 'failed'):
+        return jsonify({'ok': True, 'changed': False, 'status': status or 'done', 'msg': '当前任务已经结束，无需停止'})
+    if outcome == 'terminal':
+        return jsonify({'ok': False, 'status': status or 'idle', 'msg': '当前项目没有正在生成的任务'}), 409
+
+    run_id = job.get('run_id')
+    message = job.get('message') or '停止请求已保存，将保留已经完成的结果'
+    action = 'cooperative'
+    if prompt_id:
+        action, message = comfy_cancel_prompt_safely(prompt_id)
+        if action == 'deferred':
+            message = f'{message}；已完成结果会保留'
+        else:
+            message = f'{message}；项目正在收尾'
+        job = update_stopping_cancel_result(pid, run_id, action, message) or job
+    else:
+        job = (load_project(pid) or {}).get('production_job') or job
+    response_status = str(job.get('status') or 'stopping')
+    response_message = job.get('message') or message
+    return jsonify({
+        'ok': True, 'status': response_status, 'action': action,
+        'changed': True, 'msg': response_message, 'production_job': job,
+    }), (202 if response_status == 'stopping' else 200)
 
 # ============================== V2 分阶段筹备 ==============================
 PREP_OUTLINE_PROMPT = """你是短剧策划。请根据用户提供的故事创意，写一份供编剧确认的剧情大纲。
@@ -3612,6 +4127,20 @@ def preproduction_view(proj):
         item['progress'] = max(0, min(100, int(item.get('progress') or (100 if item.get('url') else 0))))
     return prep
 
+def finish_preproduction_llm_response(pid, run_id, payload, http_status, status, message):
+    job = finish_preproduction_llm_job(pid, run_id, status, message) or {}
+    if job.get('status') == 'stopped':
+        current = load_project(pid) or {'id': pid}
+        return jsonify({
+            'ok': True, 'stopped': True, 'status': 'stopped',
+            'msg': job.get('message') or message,
+            'production_job': job,
+            'preproduction': preproduction_view(current),
+        }), 200
+    response_payload = dict(payload)
+    response_payload['production_job'] = job
+    return jsonify(response_payload), http_status
+
 def prep_asset_batch_active(pid):
     with _PREP_ASSET_BATCH_LOCK:
         thread = _PREP_ASSET_BATCH_THREADS.get(pid)
@@ -3722,19 +4251,54 @@ def api_preproduction_outline(pid):
     proj = load_project(pid)
     if not proj or proj.get('input_mode') != 'story':
         return jsonify({'ok': False, 'msg': '项目不存在或入口模式不匹配'}), 404
-    ready, ready_err = prepare_llm_stage()
-    if not ready:
-        return jsonify({'ok': False, 'msg': f'Qwen服务准备失败：{ready_err}'}), 503
-    text, err = llm_chat([
-        {'role': 'system', 'content': PREP_OUTLINE_PROMPT},
-        {'role': 'user', 'content': proj.get('idea', '')}
-    ], max_tokens=1000, temperature=0.6)
-    if not text:
-        return jsonify({'ok': False, 'msg': f'大纲生成失败：{err}'}), 502
-    prep = prep_state(proj)
-    prep.update({'outline': text.strip(), 'outline_confirmed': False, 'step': 'outline_review'})
-    prep_touch(proj)
-    return jsonify({'ok': True, 'outline': text.strip(), 'preproduction': preproduction_view(proj)})
+    try:
+        run_id = begin_production_job(pid, 'preproduction_outline')
+    except ProjectAlreadyRunning as exc:
+        return jsonify({'ok': False, 'msg': str(exc)}), 409
+    try:
+        update_production_job(
+            pid, run_id, stage='preproduction', message='Qwen 正在生成剧情大纲')
+        raise_if_project_stopped(pid, run_id)
+        ready, ready_err = prepare_llm_stage()
+        if not ready:
+            return finish_preproduction_llm_response(
+                pid, run_id, {'ok': False, 'msg': f'Qwen服务准备失败：{ready_err}'},
+                503, 'failed', f'Qwen服务准备失败：{ready_err}')
+        raise_if_project_stopped(pid, run_id)
+        text, err = llm_chat([
+            {'role': 'system', 'content': PREP_OUTLINE_PROMPT},
+            {'role': 'user', 'content': proj.get('idea', '')}
+        ], max_tokens=1000, temperature=0.6,
+            stop_check=lambda: project_stop_requested(pid, run_id))
+        raise_if_project_stopped(pid, run_id)
+        if not text:
+            message = f'大纲生成失败：{err}'
+            return finish_preproduction_llm_response(
+                pid, run_id, {'ok': False, 'msg': message}, 502, 'failed', message)
+        with _PROJECT_IO_LOCK:
+            raise_if_project_stopped(pid, run_id)
+            proj = load_project(pid)
+            prep = prep_state(proj)
+            prep.update({'outline': text.strip(), 'outline_confirmed': False, 'step': 'outline_review'})
+            prep['updated'] = time.time()
+            job = set_production_job_status(
+                proj, 'done', '剧情大纲生成完成', finished=time.time(),
+                current_prompt_id=None, current_prompt_kind=None)
+            save_project(proj, preserve_runtime=False)
+        return jsonify({
+            'ok': True, 'outline': text.strip(),
+            'preproduction': preproduction_view(proj),
+            'production_job': job,
+        })
+    except ProjectStopRequested as exc:
+        message = str(exc) or '大纲生成已停止，原有内容已保留'
+        return finish_preproduction_llm_response(
+            pid, run_id, {'ok': True}, 200, 'stopped', message)
+    except Exception:
+        finish_preproduction_llm_job(pid, run_id, 'failed', '大纲生成异常结束，可重新生成')
+        raise
+    finally:
+        end_production_job(pid, run_id)
 
 @app.route('/api/preproduction/<pid>/outline/confirm', methods=['POST'])
 def api_preproduction_confirm_outline(pid):
@@ -3758,36 +4322,72 @@ def api_preproduction_script(pid):
     prep = prep_state(proj)
     if not prep.get('outline_confirmed'):
         return jsonify({'ok': False, 'msg': '请先确认剧情大纲'}), 409
-    ready, ready_err = prepare_llm_stage()
-    if not ready:
-        return jsonify({'ok': False, 'msg': f'Qwen服务准备失败：{ready_err}'}), 503
-    user_text = f"用户原始故事：\n{proj.get('idea', '')}\n\n已确认剧情大纲：\n{prep.get('outline', '')}"
-    content, err = llm_chat([
-        {'role': 'system', 'content': build_script_prompt(proj)},
-        {'role': 'user', 'content': user_text}
-    ], max_tokens=5000, temperature=0.65)
-    script = parse_json_from_text(content or '')
-    if not script or not script.get('shots'):
-        return jsonify({'ok': False, 'msg': f'剧本生成或解析失败：{err or "模型未返回有效 JSON"}'}), 502
-    for pos, segment in enumerate(script.get('shots', []), 1):
-        segment['index'] = pos
-        segment['segment_id'] = str(segment.get('segment_id') or f"EP01-{pos:02d}")
-        continuity_value = segment.get('continue_from_previous', False)
-        segment['continue_from_previous'] = pos > 1 and (
-            continuity_value is True or str(continuity_value).strip().lower() in ('1', 'true', 'yes', '是'))
-        try:
-            duration = int(segment.get('duration', 10))
-        except (TypeError, ValueError):
-            duration = 10
-        segment['duration'] = max(3, min(duration, 15))
-        segment['action'] = filter_slow_motion(segment.get('action', ''))
-        segment['camera'] = filter_slow_motion(segment.get('camera', ''))
-    proj['script'] = script
-    proj['prompts'] = {}
-    proj['title'] = script.get('title') or '未命名短剧'
-    prep.update({'script_confirmed': False, 'prompts_confirmed': False, 'step': 'script_review'})
-    prep_touch(proj)
-    return jsonify({'ok': True, 'script': script, 'preproduction': preproduction_view(proj)})
+    try:
+        run_id = begin_production_job(pid, 'preproduction_script')
+    except ProjectAlreadyRunning as exc:
+        return jsonify({'ok': False, 'msg': str(exc)}), 409
+    try:
+        update_production_job(
+            pid, run_id, stage='preproduction', message='Qwen 正在生成结构化剧本')
+        raise_if_project_stopped(pid, run_id)
+        ready, ready_err = prepare_llm_stage()
+        if not ready:
+            return finish_preproduction_llm_response(
+                pid, run_id, {'ok': False, 'msg': f'Qwen服务准备失败：{ready_err}'},
+                503, 'failed', f'Qwen服务准备失败：{ready_err}')
+        raise_if_project_stopped(pid, run_id)
+        user_text = f"用户原始故事：\n{proj.get('idea', '')}\n\n已确认剧情大纲：\n{prep.get('outline', '')}"
+        content, err = llm_chat([
+            {'role': 'system', 'content': build_script_prompt(proj)},
+            {'role': 'user', 'content': user_text}
+        ], max_tokens=5000, temperature=0.65,
+            stop_check=lambda: project_stop_requested(pid, run_id))
+        raise_if_project_stopped(pid, run_id)
+        script = parse_json_from_text(content or '')
+        if not script or not script.get('shots'):
+            message = f'剧本生成或解析失败：{err or "模型未返回有效 JSON"}'
+            return finish_preproduction_llm_response(
+                pid, run_id, {'ok': False, 'msg': message}, 502, 'failed', message)
+        for pos, segment in enumerate(script.get('shots', []), 1):
+            segment['index'] = pos
+            segment['segment_id'] = str(segment.get('segment_id') or f"EP01-{pos:02d}")
+            continuity_value = segment.get('continue_from_previous', False)
+            segment['continue_from_previous'] = pos > 1 and (
+                continuity_value is True or str(continuity_value).strip().lower() in ('1', 'true', 'yes', '是'))
+            try:
+                duration = int(segment.get('duration', 10))
+            except (TypeError, ValueError):
+                duration = 10
+            segment['duration'] = max(3, min(duration, 15))
+            segment['action'] = filter_slow_motion(segment.get('action', ''))
+            segment['camera'] = filter_slow_motion(segment.get('camera', ''))
+        with _PROJECT_IO_LOCK:
+            raise_if_project_stopped(pid, run_id)
+            proj = load_project(pid)
+            proj['script'] = script
+            proj['prompts'] = {}
+            proj['title'] = script.get('title') or '未命名短剧'
+            prep = prep_state(proj)
+            prep.update({'script_confirmed': False, 'prompts_confirmed': False, 'step': 'script_review'})
+            prep['updated'] = time.time()
+            job = set_production_job_status(
+                proj, 'done', '结构化剧本生成完成', finished=time.time(),
+                current_prompt_id=None, current_prompt_kind=None)
+            save_project(proj, preserve_runtime=False)
+        return jsonify({
+            'ok': True, 'script': script,
+            'preproduction': preproduction_view(proj),
+            'production_job': job,
+        })
+    except ProjectStopRequested as exc:
+        message = str(exc) or '剧本生成已停止，原有内容已保留'
+        return finish_preproduction_llm_response(
+            pid, run_id, {'ok': True}, 200, 'stopped', message)
+    except Exception:
+        finish_preproduction_llm_job(pid, run_id, 'failed', '剧本生成异常结束，可重新生成')
+        raise
+    finally:
+        end_production_job(pid, run_id)
 
 @app.route('/api/preproduction/<pid>/script/confirm', methods=['POST'])
 def api_preproduction_confirm_script(pid):
@@ -3834,45 +4434,94 @@ def api_preproduction_prompts(pid):
         return jsonify({'ok': False, 'msg': '请先确认剧本'}), 409
     if normalize_script_dialogue(proj.get('script')):
         save_project(proj)
-    ready, ready_err = prepare_llm_stage()
-    if not ready:
-        return jsonify({'ok': False, 'msg': f'Qwen服务准备失败：{ready_err}'}), 503
-    prompts = dict(proj.get('prompts') or {})
-    prompt_errors = []
-    profile_map = character_profiles_by_name(proj.get('script'))
-    for pos, shot in enumerate(proj['script'].get('shots', []), 1):
-        idx = int(shot.get('index') or pos)
-        cached = prompts.get(str(idx))
-        if cached and not validate_h3_production_prompt(cached, shot_dialogue_lines(shot), 9):
-            continue
-        # Assets are intentionally generated after prompt review. Compile against the confirmed
-        # text contract now; the complete ordered image set is attached only at H3 render time.
-        text, err = gen_shot_h3_prompt(shot, [], None, profile_map)
-        if not text:
-            prompt_errors.append(f'{segment_label(shot, idx)}：{err or "提示词生成失败"}')
-            continue
-        prompts[str(idx)] = apply_character_visual_locks(
-            filter_slow_motion(text), shot, profile_map)
-        proj['prompts'] = prompts
-        proj['prompt_format_version'] = H3_PROMPT_FORMAT_VERSION
-        save_project(proj)
-    if exclusive_on():
-        stop_local_llm()
-    prep = prep_state(proj)
-    if prompt_errors:
-        prep.update({'prompts_confirmed': False, 'step': 'prompts'})
-        prep_touch(proj)
+    try:
+        run_id = begin_production_job(pid, 'preproduction_prompts')
+    except ProjectAlreadyRunning as exc:
+        return jsonify({'ok': False, 'msg': str(exc)}), 409
+    llm_prepared = False
+    try:
+        update_production_job(
+            pid, run_id, stage='preproduction', message='Qwen 正在逐片生成 H3 提示词')
+        raise_if_project_stopped(pid, run_id)
+        ready, ready_err = prepare_llm_stage()
+        if not ready:
+            return finish_preproduction_llm_response(
+                pid, run_id, {'ok': False, 'msg': f'Qwen服务准备失败：{ready_err}'},
+                503, 'failed', f'Qwen服务准备失败：{ready_err}')
+        llm_prepared = True
+        raise_if_project_stopped(pid, run_id)
+        proj = load_project(pid)
+        prompts = dict(proj.get('prompts') or {})
+        prompt_errors = []
+        profile_map = character_profiles_by_name(proj.get('script'))
+        for pos, shot in enumerate(proj['script'].get('shots', []), 1):
+            raise_if_project_stopped(pid, run_id)
+            idx = int(shot.get('index') or pos)
+            cached = prompts.get(str(idx))
+            if cached and not validate_h3_production_prompt(cached, shot_dialogue_lines(shot), 9):
+                continue
+            update_production_job(
+                pid, run_id, message=f'Qwen 正在生成 {segment_label(shot, idx)} 提示词')
+            # Assets are intentionally generated after prompt review. Compile against the confirmed
+            # text contract now; the complete ordered image set is attached only at H3 render time.
+            text, err = gen_shot_h3_prompt(
+                shot, [], None, profile_map,
+                stop_check=lambda: project_stop_requested(pid, run_id))
+            raise_if_project_stopped(pid, run_id)
+            if not text:
+                prompt_errors.append(f'{segment_label(shot, idx)}：{err or "提示词生成失败"}')
+                continue
+            generated_prompt = apply_character_visual_locks(
+                filter_slow_motion(text), shot, profile_map)
+            with _PROJECT_IO_LOCK:
+                raise_if_project_stopped(pid, run_id)
+                proj = load_project(pid)
+                prompts = dict(proj.get('prompts') or {})
+                prompts[str(idx)] = generated_prompt
+                proj['prompts'] = prompts
+                proj['prompt_format_version'] = H3_PROMPT_FORMAT_VERSION
+                save_project(proj)
+        with _PROJECT_IO_LOCK:
+            raise_if_project_stopped(pid, run_id)
+            proj = load_project(pid)
+            prompts = dict(proj.get('prompts') or {})
+            prep = prep_state(proj)
+            if prompt_errors:
+                prep.update({'prompts_confirmed': False, 'step': 'prompts'})
+            else:
+                proj['prompt_format_version'] = H3_PROMPT_FORMAT_VERSION
+                prep.update({'prompts_confirmed': False, 'step': 'prompts_review'})
+            prep['updated'] = time.time()
+            message = ((f'{len(prompt_errors)}个片段提示词未通过，其余已保存，可再次点击只补失败项：'
+                        + '；'.join(prompt_errors[:5])) if prompt_errors else 'H3 提示词生成完成')
+            job = set_production_job_status(
+                proj, 'failed' if prompt_errors else 'done', message,
+                finished=time.time(), current_prompt_id=None, current_prompt_kind=None)
+            save_project(proj, preserve_runtime=False)
+        if prompt_errors:
+            return jsonify({
+                'ok': False, 'msg': message, 'prompts': prompts,
+                'preproduction': preproduction_view(proj),
+                'production_job': job,
+            }), 502
         return jsonify({
-            'ok': False,
-            'msg': f'{len(prompt_errors)}个片段提示词未通过，其余已保存，可再次点击只补失败项：' + '；'.join(prompt_errors[:5]),
-            'prompts': prompts,
+            'ok': True, 'prompts': prompts,
             'preproduction': preproduction_view(proj),
-        }), 502
-    proj['prompts'] = prompts
-    proj['prompt_format_version'] = H3_PROMPT_FORMAT_VERSION
-    prep.update({'prompts_confirmed': False, 'step': 'prompts_review'})
-    prep_touch(proj)
-    return jsonify({'ok': True, 'prompts': prompts, 'preproduction': preproduction_view(proj)})
+            'production_job': job,
+        })
+    except ProjectStopRequested as exc:
+        message = str(exc) or '提示词生成已停止，已完成的提示词已保留'
+        return finish_preproduction_llm_response(
+            pid, run_id, {'ok': True}, 200, 'stopped', message)
+    except Exception:
+        finish_preproduction_llm_job(pid, run_id, 'failed', '提示词生成异常结束，可重新生成')
+        raise
+    finally:
+        try:
+            if llm_prepared and exclusive_on():
+                stop_local_llm()
+        finally:
+            end_production_job(pid, run_id)
 
 @app.route('/api/preproduction/<pid>/prompts/confirm', methods=['POST'])
 def api_preproduction_confirm_prompts(pid):
@@ -3933,18 +4582,31 @@ def api_preproduction_generate_asset(pid):
     prompt = str(d.get('prompt') or item.get('prompt') or '').strip()
     if not prompt:
         return jsonify({'ok': False, 'msg': '生成提示词不能为空'}), 400
+    try:
+        run_id = begin_production_job(pid, 'asset')
+    except ProjectAlreadyRunning as exc:
+        return jsonify({'ok': False, 'msg': str(exc)}), 409
     item.update({'prompt': prompt, 'status': 'generating', 'progress': 3,
                  'message': '正在准备 ComfyUI', 'error': None, 'confirmed': False, 'updated': time.time()})
     prep_touch(proj)
     with _PREP_ASSET_BATCH_LOCK:
-        worker = threading.Thread(target=run_preproduction_single_asset, args=(pid, key, prompt), daemon=True)
+        worker = threading.Thread(target=run_preproduction_single_asset, args=(pid, key, prompt, run_id), daemon=True)
         _PREP_ASSET_MANUAL_THREADS[pid] = worker
-        worker.start()
+        try:
+            worker.start()
+        except Exception as exc:
+            _PREP_ASSET_MANUAL_THREADS.pop(pid, None)
+            update_production_job(pid, run_id, status='failed', message=f'任务启动失败：{exc}')
+            end_production_job(pid, run_id)
+            return jsonify({'ok': False, 'msg': f'任务启动失败：{exc}'}), 500
     return jsonify({'ok': True, 'started': True, 'preproduction': preproduction_view(proj)}), 202
 
-def run_preproduction_single_asset(pid, key, prompt):
+def run_preproduction_single_asset(pid, key, prompt, run_id):
     """Run one remake asynchronously so the card can render live sampling progress."""
+    final_status = 'failed'
+    final_message = '图片生成任务已结束，可重试'
     try:
+        raise_if_project_stopped(pid, run_id)
         proj = load_project(pid)
         item = next((x for x in prep_state(proj).get('asset_plan', []) if x.get('key') == key), None) if proj else None
         if not item:
@@ -3959,7 +4621,9 @@ def run_preproduction_single_asset(pid, key, prompt):
             return
         safe = re.sub(r'[^\w一-鿿-]', '_', key)
         progress_cb = make_prep_asset_progress_publisher(pid, key, item.get('name', key))
-        path, err = gen_image(prompt, save_name=f"prep_{pid}_{safe}_{int(time.time())}.png", progress_cb=progress_cb)
+        path, err = gen_image(
+            prompt, save_name=f"prep_{pid}_{safe}_{int(time.time())}.png",
+            progress_cb=progress_cb, project_pid=pid, run_id=run_id)
         if not path:
             prep_update_asset_state(pid, key, status='failed', progress=0, message=err or '生成失败', error=err or '生成失败')
             return
@@ -3970,16 +4634,35 @@ def run_preproduction_single_asset(pid, key, prompt):
                          'message': '生成完成，等待审核', 'confirmed': False, 'error': None, 'updated': time.time()})
             proj.setdefault('assets', {})[key] = {'path': path, 'kind': item.get('kind'), 'source': 'ai'}
             prep_touch(proj)
+            final_status = 'done'
+            final_message = '图片生成完成'
+    except ProjectStopRequested as exc:
+        final_status = 'stopped'
+        final_message = str(exc) or '已停止，完成的结果已保留'
+        prep_update_asset_state(pid, key, status='waiting', message=final_message, error=None)
     except Exception as exc:
         prep_update_asset_state(pid, key, status='failed', progress=0, message=str(exc), error=str(exc))
     finally:
-        with _PREP_ASSET_BATCH_LOCK:
-            _PREP_ASSET_MANUAL_THREADS.pop(pid, None)
+        try:
+            if final_status == 'stopped':
+                finalize_project_stopped(pid, run_id, final_message)
+            else:
+                update_production_job(
+                    pid, run_id, status=final_status, stop_requested=False,
+                    current_prompt_id=None, current_prompt_kind=None,
+                    message=final_message, finished=time.time())
+        finally:
+            end_production_job(pid, run_id)
+            with _PREP_ASSET_BATCH_LOCK:
+                _PREP_ASSET_MANUAL_THREADS.pop(pid, None)
 
-def run_preproduction_asset_batch(pid):
+def run_preproduction_asset_batch(pid, run_id):
     """Generate only missing preparation images, saving progress after every item."""
     errors = []
+    final_status = 'failed'
+    final_message = '批量图片任务已结束，可重试缺失图片'
     try:
+        raise_if_project_stopped(pid, run_id)
         proj = load_project(pid)
         if not proj:
             return
@@ -4000,6 +4683,7 @@ def run_preproduction_asset_batch(pid):
             if not ready:
                 raise RuntimeError(preflight_error)
         for pos, key in enumerate(missing, 1):
+            raise_if_project_stopped(pid, run_id)
             proj = load_project(pid)
             if not proj:
                 raise RuntimeError('项目在批量生成期间不存在')
@@ -4023,7 +4707,9 @@ def run_preproduction_asset_batch(pid):
             prep_touch(proj)
             safe = re.sub(r'[^\w一-鿿-]', '_', key)
             progress_cb = make_prep_asset_progress_publisher(pid, key, item.get('name', key), pos, len(missing))
-            path, err = gen_image(prompt, save_name=f"prep_{pid}_{safe}_{int(time.time())}.png", progress_cb=progress_cb)
+            path, err = gen_image(
+                prompt, save_name=f"prep_{pid}_{safe}_{int(time.time())}.png",
+                progress_cb=progress_cb, project_pid=pid, run_id=run_id)
             proj = load_project(pid) or proj
             prep = prep_state(proj)
             item = next((x for x in prep.get('asset_plan', []) if x.get('key') == key), None)
@@ -4058,6 +4744,16 @@ def run_preproduction_asset_batch(pid):
                 'updated': time.time()
             })
             prep_touch(proj)
+        final_status = 'failed' if errors else 'done'
+        final_message = ('部分图片生成失败，可重试缺失图片' if errors else '批量图片生成完成')
+    except ProjectStopRequested as exc:
+        final_status = 'stopped'
+        final_message = str(exc) or '已停止，完成的图片已保留'
+        proj = load_project(pid)
+        if proj:
+            batch = prep_state(proj).setdefault('asset_batch', {})
+            batch.update({'status': 'stopped', 'current': None, 'message': final_message, 'updated': time.time()})
+            prep_touch(proj)
     except Exception as exc:
         proj = load_project(pid)
         if proj:
@@ -4066,8 +4762,18 @@ def run_preproduction_asset_batch(pid):
             batch.update({'status': 'failed', 'current': None, 'message': str(exc), 'updated': time.time()})
             prep_touch(proj)
     finally:
-        with _PREP_ASSET_BATCH_LOCK:
-            _PREP_ASSET_BATCH_THREADS.pop(pid, None)
+        try:
+            if final_status == 'stopped':
+                finalize_project_stopped(pid, run_id, final_message)
+            else:
+                update_production_job(
+                    pid, run_id, status=final_status, stop_requested=False,
+                    current_prompt_id=None, current_prompt_kind=None,
+                    message=final_message, finished=time.time())
+        finally:
+            end_production_job(pid, run_id)
+            with _PREP_ASSET_BATCH_LOCK:
+                _PREP_ASSET_BATCH_THREADS.pop(pid, None)
 
 @app.route('/api/preproduction/<pid>/assets/generate-missing', methods=['POST'])
 def api_preproduction_generate_missing_assets(pid):
@@ -4089,7 +4795,11 @@ def api_preproduction_generate_missing_assets(pid):
         manual = _PREP_ASSET_MANUAL_THREADS.get(pid)
         if (active and active.is_alive()) or (manual and manual.is_alive()):
             return jsonify({'ok': False, 'msg': '已有图片生成任务进行中'}), 409
-        thread = threading.Thread(target=run_preproduction_asset_batch, args=(pid,), daemon=True)
+        try:
+            run_id = begin_production_job(pid, 'asset_batch')
+        except ProjectAlreadyRunning as exc:
+            return jsonify({'ok': False, 'msg': str(exc)}), 409
+        thread = threading.Thread(target=run_preproduction_asset_batch, args=(pid, run_id), daemon=True)
         _PREP_ASSET_BATCH_THREADS[pid] = thread
         prep['asset_batch'] = {
             'status': 'starting', 'total': 0, 'completed': 0, 'failed': 0,
@@ -4097,7 +4807,13 @@ def api_preproduction_generate_missing_assets(pid):
             'message': '正在启动批量生成', 'updated': time.time()
         }
         prep_touch(proj)
-        thread.start()
+        try:
+            thread.start()
+        except Exception as exc:
+            _PREP_ASSET_BATCH_THREADS.pop(pid, None)
+            update_production_job(pid, run_id, status='failed', message=f'任务启动失败：{exc}')
+            end_production_job(pid, run_id)
+            return jsonify({'ok': False, 'msg': f'任务启动失败：{exc}'}), 500
     return jsonify({'ok': True, 'started': True, 'preproduction': preproduction_view(proj)}), 202
 
 @app.route('/api/preproduction/<pid>/asset/upload', methods=['POST'])
@@ -4369,7 +5085,8 @@ def api_project(pid):
     p = load_project(pid)
     if not p:
         return jsonify({"ok": False, "msg": "项目不存在"}), 404
-    recover_interrupted_shot_retries(p)
+    if recover_interrupted_shot_retries(p):
+        p = load_project(pid) or p
     # 转换资产路径为URL
     assets_view = []
     for k, a in p.get('assets', {}).items():
