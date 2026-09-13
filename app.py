@@ -528,7 +528,7 @@ def get_h3_model_name(mode):
     return configured or H3_MODEL_PROFILES[get_h3_model_profile()][family]
 
 def resolve_h3_model_name(mode, available=None):
-    """Resolve the requested profile to an installed model without crossing FL2VA/REF2VA families."""
+    """Resolve a workflow-role model; explicit choices are never guessed or substituted."""
     requested = get_h3_model_name(mode)
     available = list(available if available is not None else comfy_unet_models())
     if not available or requested in available:
@@ -561,7 +561,7 @@ def resolve_h3_model_name(mode, available=None):
     return selected
 
 def apply_h3_model(workflow, mode):
-    """将用户选择的模型档位写入工作流；r2v 与 fl2va 自动配对。"""
+    """将各工作流用途槽位选中的模型写入对应工作流。"""
     model_name = resolve_h3_model_name(mode)
     loaders = [node for node in workflow.values()
                if isinstance(node, dict) and node.get('class_type') == 'UNETLoader']
@@ -572,8 +572,10 @@ def apply_h3_model(workflow, mode):
     return model_name
 
 def comfy_unet_models():
-    return [name for name in comfy_loader_models('UNETLoader')
-            if 'minimax' in name.lower() and 'h3' in name.lower()]
+    # ComfyUI does not publish reliable architecture metadata for arbitrary
+    # community UNET names. Return its complete loader enum and let users map
+    # any candidate to either workflow role; runtime errors remain explicit.
+    return comfy_loader_models('UNETLoader')
 
 def comfy_loader_models(class_type):
     """Return exact model options exposed by one connected ComfyUI loader."""
@@ -4012,9 +4014,10 @@ def api_models():
         },
         'video': {
             'models': video_models,
-            'fl2va': [name for name in video_models if 'fl2va' in name.lower().replace('-', '_')],
-            'ref2va': [name for name in video_models
-                       if any(token in name.lower().replace('-', '_') for token in ('ref2va', 'remix'))],
+            # Compatibility aliases for older pages. Both workflow roles now
+            # intentionally receive the same unfiltered ComfyUI candidate set.
+            'fl2va': video_models,
+            'ref2va': video_models,
             'selected_fl2va': CONFIG.get('h3_fl2va_model', ''),
             'selected_ref2va': CONFIG.get('h3_ref2va_model', ''),
         },

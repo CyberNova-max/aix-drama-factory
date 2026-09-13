@@ -191,7 +191,7 @@
       <label class="text-xs text-gray-400" title="H3采样步数4~25，越低越快、越高越精细">步数</label>
       <input id="h3Steps" type="number" min="4" max="25" step="1" value="10" title="H3采样步数4~25，越低越快、越高越精细" class="bg-black/30 border border-white/10 rounded-lg px-2 py-2 text-sm w-16 text-center">
       <label class="text-xs text-gray-400">H3模型</label>
-      <select id="h3Model" class="bg-black/30 border border-white/10 rounded-lg px-3 py-2 text-sm" title="会根据r2v或fl2va模式自动匹配对应模型">
+      <select id="h3Model" class="bg-black/30 border border-white/10 rounded-lg px-3 py-2 text-sm" title="预设自动档位；各工作流的精确模型可在设置中分别选择">
         <option value="pruned">精简版 INT8（12GB推荐）</option>
       </select>
       <label class="flex items-center gap-1.5 text-xs text-gray-300 cursor-pointer select-none" title="开启后：剧本解析完成时流程暂停，您可在资产卡片上传自备参考图（可只传部分，空缺由AI生成），点击继续后流程接着走">
@@ -345,9 +345,10 @@
           <p class="text-gray-500 mt-1" style="font-size:11px;">从 LLM 模型目录扫描 GGUF；保存后需重启本地 LLM 服务。</p>
         </div>
         <div class="grid grid-cols-2 gap-3">
-          <div><label class="text-xs text-gray-400 block mb-1">H3 FL2VA 模型</label><select id="cfg-h3-fl2va" class="w-full bg-black/30 border border-white/10 rounded-lg px-3 py-2"><option value="">自动匹配</option></select></div>
-          <div><label class="text-xs text-gray-400 block mb-1">H3 REF2VA / Remix 模型</label><select id="cfg-h3-ref2va" class="w-full bg-black/30 border border-white/10 rounded-lg px-3 py-2"><option value="">自动匹配</option></select></div>
+          <div><label class="text-xs text-gray-400 block mb-1">FL2VA 工作流模型（文生/首帧）</label><select id="cfg-h3-fl2va" class="w-full bg-black/30 border border-white/10 rounded-lg px-3 py-2"><option value="">沿用预设自动模型</option></select></div>
+          <div><label class="text-xs text-gray-400 block mb-1">多参考 / Remix 工作流模型</label><select id="cfg-h3-ref2va" class="w-full bg-black/30 border border-white/10 rounded-lg px-3 py-2"><option value="">沿用预设自动模型</option></select></div>
         </div>
+        <p class="text-gray-500" style="font-size:11px;line-height:1.5;">这是两个独立的工作流用途槽位，候选列表完全相同；允许选择同一个模型或交叉使用社区魔改模型。AIX 不按文件名预判兼容性，真正不兼容时会显示 ComfyUI 的运行错误。</p>
         <div>
           <label class="text-xs text-gray-400 block mb-1">生图工作流</label>
           <select id="cfg-image-workflow" onchange="updateImageModelOptions('')" class="w-full bg-black/30 border border-white/10 rounded-lg px-3 py-2"><option value="t2i_qwen2512.json">Qwen Image 2512</option></select>
@@ -1146,8 +1147,9 @@ async function loadModelCatalog(force=false,config=null){
     const c=config||await(await fetch('/api/config',{cache:'no-store'})).json();
     fillModelSelect('cfg-local-llm-file',modelCatalog.llm?.local_files||[],c.qwen_model_path||'','未检测到本地 GGUF');
     $('cfg-llm-service-models').innerHTML=(modelCatalog.llm?.service_models||[]).map(name=>`<option value="${escapeHtml(name)}"></option>`).join('');
-    fillModelSelect('cfg-h3-fl2va',modelCatalog.video?.fl2va||[],c.h3_fl2va_model||'','自动匹配 FL2VA');
-    fillModelSelect('cfg-h3-ref2va',modelCatalog.video?.ref2va||[],c.h3_ref2va_model||'','自动匹配 REF2VA / Remix');
+    const videoModels=modelCatalog.video?.models||[];
+    fillModelSelect('cfg-h3-fl2va',videoModels,c.h3_fl2va_model||'','沿用预设自动模型');
+    fillModelSelect('cfg-h3-ref2va',videoModels,c.h3_ref2va_model||'','沿用预设自动模型');
     const workflows=modelCatalog.image?.workflows||[];
     $('cfg-image-workflow').innerHTML=workflows.map(item=>`<option value="${escapeHtml(item.id)}">${escapeHtml(item.label)}</option>`).join('')||'<option value="">未检测到适配器</option>';
     $('cfg-image-workflow').value=c.image_workflow||modelCatalog.image?.selected_workflow||'';

@@ -38,6 +38,53 @@ class ModelSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'chosen-fl2va'):
             factory.resolve_h3_model_name('t2v', ['different-fl2va.safetensors'])
 
+    @patch.object(factory, 'comfy_loader_models', return_value=[
+        'Feihou\\community-video.safetensors',
+        'Dsiwa-remix-v2.safetensors',
+        'unexpected_name.safetensors',
+    ])
+    def test_video_model_discovery_keeps_all_comfy_unets(self, loader_models):
+        expected = [
+            'Feihou\\community-video.safetensors',
+            'Dsiwa-remix-v2.safetensors',
+            'unexpected_name.safetensors',
+        ]
+        self.assertEqual(factory.comfy_unet_models(), expected)
+        loader_models.assert_called_once_with('UNETLoader')
+
+    @patch.object(factory, 'comfy_unet_models', return_value=[
+        'classic-fl2va.safetensors',
+        'community-remix.safetensors',
+    ])
+    def test_cross_selected_models_are_injected_by_workflow_role(self, _models):
+        factory.CONFIG.update({
+            'h3_fl2va_model': 'community-remix.safetensors',
+            'h3_ref2va_model': 'classic-fl2va.safetensors',
+        })
+        fl2va_workflow = {
+            '1': {'class_type': 'UNETLoader', 'inputs': {'unet_name': 'old-video-model'}},
+        }
+        ref2va_workflow = {
+            '2': {'class_type': 'UNETLoader', 'inputs': {'unet_name': 'old-remix-model'}},
+        }
+
+        self.assertEqual(
+            factory.apply_h3_model(fl2va_workflow, 't2v'),
+            'community-remix.safetensors',
+        )
+        self.assertEqual(
+            factory.apply_h3_model(ref2va_workflow, 'r2v'),
+            'classic-fl2va.safetensors',
+        )
+        self.assertEqual(
+            fl2va_workflow['1']['inputs']['unet_name'],
+            'community-remix.safetensors',
+        )
+        self.assertEqual(
+            ref2va_workflow['2']['inputs']['unet_name'],
+            'classic-fl2va.safetensors',
+        )
+
     def test_local_llm_catalog_excludes_mmproj(self):
         with tempfile.TemporaryDirectory() as directory:
             open(os.path.join(directory, 'model-a.gguf'), 'wb').close()
@@ -63,7 +110,10 @@ class ModelSelectionTests(unittest.TestCase):
         self.assertEqual(workflow['json']['133']['inputs']['unet_name'], selected)
 
     @patch.object(factory, 'image_workflow_catalog', return_value=[])
-    @patch.object(factory, 'comfy_unet_models', return_value=['minimax_h3_fl2va_test.safetensors'])
+    @patch.object(factory, 'comfy_unet_models', return_value=[
+        'Feihou\\community-video.safetensors',
+        'Dsiwa-remix-v2.safetensors',
+    ])
     @patch.object(factory, 'local_llm_models', return_value=[])
     @patch.object(factory.requests, 'get')
     def test_models_api_groups_available_choices(self, get, _local, _video, _image):
@@ -73,7 +123,13 @@ class ModelSelectionTests(unittest.TestCase):
         get.return_value = response
         data = self.client.get('/api/models').get_json()
         self.assertEqual(data['llm']['service_models'], ['qwen-local'])
-        self.assertEqual(data['video']['fl2va'], ['minimax_h3_fl2va_test.safetensors'])
+        expected = [
+            'Feihou\\community-video.safetensors',
+            'Dsiwa-remix-v2.safetensors',
+        ]
+        self.assertEqual(data['video']['models'], expected)
+        self.assertEqual(data['video']['fl2va'], expected)
+        self.assertEqual(data['video']['ref2va'], expected)
 
     @patch.object(factory, 'save_config')
     def test_config_rejects_unknown_image_workflow(self, _save):
@@ -83,13 +139,26 @@ class ModelSelectionTests(unittest.TestCase):
     @patch.object(factory, 'save_config')
     def test_config_accepts_exact_model_selections(self, _save):
         response = self.client.post('/api/config', json={
-            'h3_fl2va_model': 'minimax_h3_fl2va_custom.safetensors',
-            'h3_ref2va_model': 'minimax_h3_ref2va_custom.safetensors',
+            'h3_fl2va_model': 'Dsiwa-remix-v2.safetensors',
+            'h3_ref2va_model': 'Feihou\\community-video.safetensors',
             'image_workflow': 't2i_qwen2512.json',
             'image_model': 'Qwen\\custom.gguf',
         })
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json()['config']['image_model'], 'Qwen\\custom.gguf')
+        saved = response.get_json()['config']
+        self.assertEqual(saved['h3_fl2va_model'], 'Dsiwa-remix-v2.safetensors')
+        self.assertEqual(saved['h3_ref2va_model'], 'Feihou\\community-video.safetensors')
+        self.assertEqual(saved['image_model'], 'Qwen\\custom.gguf')
+
+    @patch.object(factory, 'save_config')
+    def test_same_video_model_can_be_saved_for_both_workflow_roles(self, _save):
+        response = self.client.post('/api/config', json={
+            'h3_fl2va_model': 'shared-community-model.safetensors',
+            'h3_ref2va_model': 'shared-community-model.safetensors',
+        })
+        self.assertEqual(response.status_code, 200)
+        saved = response.get_json()['config']
+        self.assertEqual(saved['h3_fl2va_model'], saved['h3_ref2va_model'])
 
     def test_web_settings_expose_all_three_model_groups(self):
         with open(os.path.join(ROOT, 'index.html'), 'r', encoding='utf-8') as handle:
@@ -98,6 +167,10 @@ class ModelSelectionTests(unittest.TestCase):
                            'cfg-image-workflow', 'cfg-image-model'):
             self.assertIn(f'id="{element_id}"', page)
         self.assertIn("fetch('/api/models'", page)
+        self.assertIn('FL2VA 工作流模型（文生/首帧）', page)
+        self.assertIn('多参考 / Remix 工作流模型', page)
+        self.assertIn('const videoModels=modelCatalog.video?.models||[];', page)
+        self.assertIn('允许选择同一个模型或交叉使用社区魔改模型', page)
 
 
 if __name__ == '__main__':

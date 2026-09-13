@@ -4,6 +4,7 @@
 
 - Added a Web model selector that scans local GGUF language models, exact MiniMax H3 FL2VA/REF2VA models exposed by ComfyUI, and image models supported by installed T2I workflow adapters.
 - Added exact H3 model pairing and runtime workflow injection while retaining the legacy pruned/full automatic profiles.
+- Changed the two H3 selectors into independent workflow-role slots backed by the same complete ComfyUI UNET list, allowing identical, cross-family, and community-named models without filename filtering or selection-time compatibility blocking.
 - Added pluggable `t2i_*.json` image workflow adapters so Qwen, Flux, Z-Image, Krea, and other architectures can be exposed only with their matching encoder/VAE/sampler graph instead of unsafe filename-only substitution.
 - Made local LLM `mmproj` optional so text-only GGUF models can be selected; multimodal models still use it when the configured file exists.
 - Fixed an intermittent false "project already has a generation task" response when a page status poll briefly competed with a failed-segment retry for the same project lock.
