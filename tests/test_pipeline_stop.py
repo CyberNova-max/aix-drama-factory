@@ -330,6 +330,16 @@ class PipelineStopTests(unittest.TestCase):
         self.assertEqual(competing_claims, [False])
         self.assertFalse(factory.project_job_active('project-1'))
 
+    def test_idle_project_poll_does_not_claim_production_lock(self):
+        project = self.save_active(prompt_id=None, status='failed')
+
+        with patch.object(factory, 'claim_project_job', wraps=factory.claim_project_job) as claim:
+            changed = factory.recover_interrupted_shot_retries(project)
+
+        self.assertFalse(changed)
+        claim.assert_not_called()
+        self.assertFalse(factory.project_job_active('project-1'))
+
     def test_duplicate_begin_is_rejected(self):
         project = self.save_active(prompt_id=None, status='stopped')
         project['production_job']['updated'] = 0
