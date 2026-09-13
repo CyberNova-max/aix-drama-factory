@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Fixed an intermittent false "project already has a generation task" response when a page status poll briefly competed with a failed-segment retry for the same project lock.
+- Avoided taking the production lock during interrupted-task recovery when the persisted project state has nothing to recover.
+
 ## 2.0.0-dev.11 - 2026-09-12
 
 - Fixed 24 GB GPU out-of-memory failures by removing the TE-Speed layer cache from all bundled H3 workflows; retained INT8/SageAttention and added four-way low-VRAM attention and feed-forward chunking.

@@ -3524,6 +3524,14 @@ def single_shot_status(task_id):
 def recover_interrupted_shot_retries(proj):
     """Recover persisted production state only when no process still owns this project."""
     pid = proj.get('id')
+    states = (proj.get('item_states') or {}).get('shots') or {}
+    interrupted = [
+        state for state in states.values()
+        if state.get('retry_count') and state.get('status') in ('retrying', 'prompting', 'generating')
+    ]
+    production_job = proj.get('production_job') or {}
+    if not interrupted and production_job.get('status') not in ACTIVE_PRODUCTION_STATUSES:
+        return False
     recovery_id = f"recovery-{uuid.uuid4().hex}"
     if not pid or not claim_project_job(pid, recovery_id):
         return False
@@ -3858,6 +3866,7 @@ def api_status():
     except Exception:
         llm_ok = False
     return jsonify({
+        "version": app_version(),
         "llm_online": llm_ok, "llm_endpoint": base, "llm_model": model,
         "comfyui_online": comfy_check(), "comfyui_url": comfy_url(),
         "ffmpeg": bool(find_ffmpeg()), "acceleration": acceleration_status(),
