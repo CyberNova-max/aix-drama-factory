@@ -317,13 +317,14 @@
           </select>
         </div>
         <div><label class="text-xs text-gray-400 block mb-1">Qwen 服务地址</label><input id="cfg-local-llm-url" class="w-full bg-black/30 border border-white/10 rounded-lg px-3 py-2" placeholder="http://127.0.0.1:8085"></div>
-        <div><label class="text-xs text-gray-400 block mb-1">模型名</label><input id="cfg-local-llm-model" class="w-full bg-black/30 border border-white/10 rounded-lg px-3 py-2" placeholder="qwen3.5-4b"></div>
+        <div><label class="text-xs text-gray-400 block mb-1">模型名</label><input id="cfg-local-llm-model" list="cfg-llm-service-models" class="w-full bg-black/30 border border-white/10 rounded-lg px-3 py-2" placeholder="qwen3.5-4b"></div>
       </div>
       <div id="cfg-custom-box" class="space-y-3 hidden">
         <div><label class="text-xs text-gray-400 block mb-1">Base URL</label><input id="cfg-base-url" class="w-full bg-black/30 border border-white/10 rounded-lg px-3 py-2" placeholder="http://127.0.0.1:9006/v1"></div>
         <div><label class="text-xs text-gray-400 block mb-1">API Key</label><input id="cfg-api-key" class="w-full bg-black/30 border border-white/10 rounded-lg px-3 py-2" placeholder="EMPTY"></div>
-        <div><label class="text-xs text-gray-400 block mb-1">模型名</label><input id="cfg-model" class="w-full bg-black/30 border border-white/10 rounded-lg px-3 py-2" placeholder="qwen3.8-27b"></div>
+        <div><label class="text-xs text-gray-400 block mb-1">模型名</label><input id="cfg-model" list="cfg-llm-service-models" class="w-full bg-black/30 border border-white/10 rounded-lg px-3 py-2" placeholder="qwen3.8-27b"></div>
       </div>
+      <datalist id="cfg-llm-service-models"></datalist>
       <div>
         <label class="text-xs text-gray-400 block mb-1">ComfyUI 运行方式</label>
         <select id="cfg-comfy-runtime-mode" class="w-full bg-black/30 border border-white/10 rounded-lg px-3 py-2">
@@ -332,6 +333,32 @@
         </select>
       </div>
       <div><label class="text-xs text-gray-400 block mb-1">ComfyUI 地址</label><input id="cfg-comfy" class="w-full bg-black/30 border border-white/10 rounded-lg px-3 py-2" placeholder="http://127.0.0.1:8190"></div>
+      <section class="glass rounded-xl px-3 py-3 space-y-3">
+        <div class="flex items-center gap-2">
+          <div><div class="text-sm font-semibold">🧩 模型选择</div><p class="text-gray-500 mt-0.5" style="font-size:11px;">自动读取本地 GGUF 与 ComfyUI 已安装模型；切换前请确认显存和工作流兼容性。</p></div>
+          <div class="flex-1"></div>
+          <button type="button" onclick="loadModelCatalog(true)" class="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10">↻ 扫描</button>
+        </div>
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">本地 LLM 模型文件</label>
+          <select id="cfg-local-llm-file" class="w-full bg-black/30 border border-white/10 rounded-lg px-3 py-2"><option value="">正在读取…</option></select>
+          <p class="text-gray-500 mt-1" style="font-size:11px;">从 LLM 模型目录扫描 GGUF；保存后需重启本地 LLM 服务。</p>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div><label class="text-xs text-gray-400 block mb-1">H3 FL2VA 模型</label><select id="cfg-h3-fl2va" class="w-full bg-black/30 border border-white/10 rounded-lg px-3 py-2"><option value="">自动匹配</option></select></div>
+          <div><label class="text-xs text-gray-400 block mb-1">H3 REF2VA / Remix 模型</label><select id="cfg-h3-ref2va" class="w-full bg-black/30 border border-white/10 rounded-lg px-3 py-2"><option value="">自动匹配</option></select></div>
+        </div>
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">生图工作流</label>
+          <select id="cfg-image-workflow" onchange="updateImageModelOptions('')" class="w-full bg-black/30 border border-white/10 rounded-lg px-3 py-2"><option value="t2i_qwen2512.json">Qwen Image 2512</option></select>
+        </div>
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">生图扩散模型</label>
+          <select id="cfg-image-model" class="w-full bg-black/30 border border-white/10 rounded-lg px-3 py-2"><option value="">使用工作流默认模型</option></select>
+          <p id="cfg-image-hint" class="text-gray-500 mt-1" style="font-size:11px;">不同架构必须使用对应工作流；仅更换模型文件不能把 Qwen 工作流变成 Flux、Z-Image 或 Krea。</p>
+        </div>
+        <div id="cfg-model-scan-status" class="text-xs text-gray-500"></div>
+      </section>
       <details class="glass rounded-lg px-3 py-2.5">
         <summary class="cursor-pointer text-xs text-gray-300">高级运行路径（整包用户无需修改）</summary>
         <div class="space-y-3 mt-3">
@@ -458,6 +485,7 @@ let mainInputMode=localStorage.getItem('main_h3_input_mode')==='h3_prompt'?'h3_p
 let showH3Prompts=localStorage.getItem('h3_show_prompts')==='1';
 let guidedFlow=localStorage.getItem('guided_preproduction')!=='0', currentPrepProject=null, panelInitialized=false;
 let prepAssetPollTimer=null, prepAssetStarting=false;
+let modelCatalog=null;
 let portalLinks={
   tutorial:'https://space.bilibili.com/1304008552',
   software:'https://my.feishu.cn/wiki/Fksqw9lvgi1RKkk306jckqfHnwg?from=from_copylink'
@@ -1092,6 +1120,41 @@ async function openSettings(){
   $('cfg-steps').value=c.h3_steps??10;$('cfg-steps-val').textContent=c.h3_steps??10;
   $('cfg-exclusive').checked=!!c.exclusive_mode;
   toggleRuntimeFields();$('settings-modal').classList.replace('hidden','flex');
+  await loadModelCatalog(false,c);
+}
+function fillModelSelect(id,items,selected,emptyLabel){
+  const sel=$(id), values=(items||[]).map(item=>typeof item==='string'?{value:item,label:item}:{value:item.path,label:item.label});
+  const options=[{value:'',label:emptyLabel},...values];
+  if(selected&&!options.some(item=>item.value===selected))options.push({value:selected,label:`${selected}（当前配置，未检测到）`});
+  sel.innerHTML=options.map(item=>`<option value="${escapeHtml(item.value)}">${escapeHtml(item.label)}</option>`).join('');
+  sel.value=selected||'';
+}
+function updateImageModelOptions(selected){
+  const workflow=(modelCatalog?.image?.workflows||[]).find(item=>item.id===$('cfg-image-workflow').value);
+  const wanted=selected===undefined?(modelCatalog?.image?.selected_model||''):selected;
+  fillModelSelect('cfg-image-model',workflow?.models||[],wanted,'使用工作流默认模型');
+  $('cfg-image-hint').textContent=workflow
+    ?`${workflow.label} · ${workflow.loader}；不同架构必须使用对应工作流适配器。`
+    :'没有检测到可用的生图工作流适配器。';
+}
+async function loadModelCatalog(force=false,config=null){
+  const status=$('cfg-model-scan-status');status.textContent='正在扫描模型…';
+  try{
+    const response=await fetch('/api/models',{cache:force?'reload':'no-store'});
+    if(!response.ok)throw new Error(`HTTP ${response.status}`);
+    modelCatalog=await response.json();
+    const c=config||await(await fetch('/api/config',{cache:'no-store'})).json();
+    fillModelSelect('cfg-local-llm-file',modelCatalog.llm?.local_files||[],c.qwen_model_path||'','未检测到本地 GGUF');
+    $('cfg-llm-service-models').innerHTML=(modelCatalog.llm?.service_models||[]).map(name=>`<option value="${escapeHtml(name)}"></option>`).join('');
+    fillModelSelect('cfg-h3-fl2va',modelCatalog.video?.fl2va||[],c.h3_fl2va_model||'','自动匹配 FL2VA');
+    fillModelSelect('cfg-h3-ref2va',modelCatalog.video?.ref2va||[],c.h3_ref2va_model||'','自动匹配 REF2VA / Remix');
+    const workflows=modelCatalog.image?.workflows||[];
+    $('cfg-image-workflow').innerHTML=workflows.map(item=>`<option value="${escapeHtml(item.id)}">${escapeHtml(item.label)}</option>`).join('')||'<option value="">未检测到适配器</option>';
+    $('cfg-image-workflow').value=c.image_workflow||modelCatalog.image?.selected_workflow||'';
+    modelCatalog.image.selected_model=c.image_model||'';updateImageModelOptions(c.image_model||'');
+    $('cfg-qwen-model-path').value=c.qwen_model_path||'';
+    status.textContent=`已找到 ${modelCatalog.llm?.local_files?.length||0} 个本地 LLM、${modelCatalog.video?.models?.length||0} 个 H3 模型、${workflows.length} 个生图适配器。`;
+  }catch(e){status.textContent=`模型扫描失败：${e.message}`;}
 }
 async function loadH3Models(){
   try{
@@ -1099,14 +1162,17 @@ async function loadH3Models(){
     for(const id of ['h3Model','single-model']){
       const sel=$(id);if(!sel)continue;
       sel.innerHTML=data.profiles.map(p=>`<option value="${p.id}" ${p.available?'':'disabled'}>${p.label}${p.available?'':'（未检测到）'}</option>`).join('');
-      sel.value=data.selected;
+      if(data.selected_fl2va||data.selected_ref2va){
+        const option=document.createElement('option');option.value='__exact__';option.textContent='自定义模型配对（设置）';sel.appendChild(option);sel.value='__exact__';
+      }else sel.value=data.selected;
     }
   }catch(e){log('H3模型列表读取失败，请检查ComfyUI连接','text-red-400');}
 }
 async function setH3ModelProfile(profile,source='main'){
+  if(profile==='__exact__')return;
   if($('h3Model'))$('h3Model').value=profile;
   if($('single-model'))$('single-model').value=profile;
-  await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({h3_model_profile:profile})});
+  await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({h3_model_profile:profile,h3_fl2va_model:'',h3_ref2va_model:''})});
   refreshStatus();
   if(source)log(`H3模型已切换为：${profile==='full'?'完整版 INT8':'精简版 INT8'}`,'text-green-400');
 }
@@ -1147,7 +1213,9 @@ async function saveSettings(){
     local_llm_runtime_mode:$('cfg-llm-runtime-mode').value,local_llm_url:$('cfg-local-llm-url').value,
     local_llm_model:$('cfg-local-llm-model').value,comfyui_runtime_mode:$('cfg-comfy-runtime-mode').value,
     comfyui_start_script:$('cfg-comfy-script').value,llama_server_path:$('cfg-llama-path').value,
-    qwen_model_path:$('cfg-qwen-model-path').value,qwen_mmproj_path:$('cfg-qwen-mmproj-path').value,
+    qwen_model_path:$('cfg-local-llm-file').value||$('cfg-qwen-model-path').value,qwen_mmproj_path:$('cfg-qwen-mmproj-path').value,
+    h3_fl2va_model:$('cfg-h3-fl2va').value,h3_ref2va_model:$('cfg-h3-ref2va').value,
+    image_workflow:$('cfg-image-workflow').value,image_model:$('cfg-image-model').value,
     ffmpeg_path:$('cfg-ffmpeg-path').value,
     megapixels:parseFloat(mp),h3_steps:parseInt($('cfg-steps').value),exclusive_mode:$('cfg-exclusive').checked,style:getStyleValue()||'电影写实',
     shot_duration:$('shotDuration').value,shot_count:$('shotCount').value,scene_reference_mode:$('sceneRefMode').value};
@@ -1155,7 +1223,7 @@ async function saveSettings(){
   const response=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const result=await response.json();
   if(!response.ok){log(`设置保存失败：${result.error||'配置无效'}`,'text-red-400');return;}
-  closeSettings();refreshStatus();log('设置已保存；运行方式将在下次服务调用时生效','text-green-400');
+  closeSettings();await loadH3Models();refreshStatus();log('设置已保存；ComfyUI 模型下次生成生效，本地 LLM 模型需重启服务','text-green-400');
 }
 
 // 页面初始化：恢复上次配置到主面板下拉框
@@ -1171,7 +1239,7 @@ async function initPanel(){
   try{
     const c=await(await fetch('/api/config')).json();
     await loadH3Models();
-    if(c.h3_model_profile&&$('h3Model')){$('h3Model').value=c.h3_model_profile;$('single-model').value=c.h3_model_profile;}
+    if(c.h3_model_profile&&$('h3Model')&&!c.h3_fl2va_model&&!c.h3_ref2va_model){$('h3Model').value=c.h3_model_profile;$('single-model').value=c.h3_model_profile;}
     if(c.style){
       const presets=[...$('style').options].map(o=>o.value||o.text).filter(v=>v!=='__custom__');
       if(presets.includes(c.style)){$('style').value=c.style;$('styleCustom').value='';}

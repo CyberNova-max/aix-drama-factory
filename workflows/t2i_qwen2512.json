@@ -1,4 +1,9 @@
 {
+  "meta": {
+    "label": "Qwen Image 2512",
+    "family": "qwen-image",
+    "model_prefix": "Qwen"
+  },
   "json": {
     "133": {
       "inputs": {
