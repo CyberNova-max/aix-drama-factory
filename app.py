@@ -48,6 +48,10 @@ DEFAULT_CONFIG = {
     "llama_server_path": "llm/qwen4b/llama/llama-server.exe",
     "qwen_model_path": "llm/qwen4b/models/Qwen3.5-4B-Q4_K_M.gguf",
     "qwen_mmproj_path": "llm/qwen4b/models/mmproj-BF16.gguf",
+    "h3_fl2va_model": "",                  # 留空时按 h3_model_profile 自动匹配
+    "h3_ref2va_model": "",                 # 留空时按 h3_model_profile 自动匹配
+    "image_workflow": "t2i_qwen2512.json", # workflows 下的生图适配器
+    "image_model": "",                     # 留空时使用生图工作流内置模型
     "ffmpeg_path": "tools/ffmpeg/ffmpeg.exe",
     "style": "电影写实",
     "scene_reference_mode": "auto",          # auto=按画风匹配 | photo=真实取景 | concept=概念设定
@@ -218,6 +222,33 @@ def qwen_mmproj_path():
     return resolve_runtime_path(CONFIG.get('qwen_mmproj_path'),
                                 os.path.join(QWEN_MODEL_DIR, 'mmproj-BF16.gguf'))
 
+def local_llm_models():
+    """List local text GGUF files without exposing unrelated filesystem contents."""
+    roots = {os.path.normpath(QWEN_MODEL_DIR), os.path.dirname(qwen_model_path())}
+    models = []
+    seen = set()
+    for root in sorted(roots):
+        if not root or not os.path.isdir(root):
+            continue
+        for current, dirs, names in os.walk(root):
+            dirs[:] = sorted(dirs)[:50]
+            for name in sorted(names):
+                path = os.path.normpath(os.path.join(current, name))
+                if (not name.lower().endswith('.gguf') or name.lower().startswith('mmproj')):
+                    continue
+                key = os.path.normcase(path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    value = os.path.relpath(path, BASE_DIR)
+                    if value.startswith('..' + os.sep):
+                        value = path
+                except ValueError:
+                    value = path
+                models.append({'label': name, 'path': value, 'size': os.path.getsize(path)})
+    return models
+
 def runtime_env_command(name):
     """Read a trusted service command from the host environment, never from the web UI."""
     raw = str(os.environ.get(name, '') or '').strip()
@@ -365,7 +396,7 @@ def _ensure_local_llm_unlocked():
     server_path = llama_server_path()
     model_path = qwen_model_path()
     mmproj_path = qwen_mmproj_path()
-    missing = [path for path in (server_path, model_path, mmproj_path) if not os.path.exists(path)]
+    missing = [path for path in (server_path, model_path) if not os.path.exists(path)]
     if missing:
         return False, f"本地LLM文件不存在: {missing[0]}"
     print("[LLM] 启动本地Qwen3.5-4B服务...")
@@ -374,13 +405,16 @@ def _ensure_local_llm_unlocked():
     log_path = os.path.join(LOGS_DIR, 'qwen.autostart.log')
     log_file = open(log_path, 'ab', buffering=0)
     try:
-        subprocess.Popen([
-            server_path, '--model', model_path, '--mmproj', mmproj_path,
+        command = [
+            server_path, '--model', model_path,
             '--host', urlparse(base).hostname or '127.0.0.1',
             '--port', str(urlparse(base).port or 8085), '--ctx-size', '16384',
             '--n-predict', '4096', '--n-gpu-layers', '-1', '--flash-attn', 'on',
             '--reasoning-budget', '0'
-        ], cwd=os.path.dirname(server_path), creationflags=creationflags,
+        ]
+        if mmproj_path and os.path.isfile(mmproj_path):
+            command[3:3] = ['--mmproj', mmproj_path]
+        subprocess.Popen(command, cwd=os.path.dirname(server_path), creationflags=creationflags,
            stdout=log_file, stderr=log_file)
     finally:
         log_file.close()
@@ -490,14 +524,18 @@ def get_h3_model_profile():
 
 def get_h3_model_name(mode):
     family = 'ref2va' if mode == 'r2v' else 'fl2va'
-    return H3_MODEL_PROFILES[get_h3_model_profile()][family]
+    configured = str(CONFIG.get(f'h3_{family}_model') or '').strip()
+    return configured or H3_MODEL_PROFILES[get_h3_model_profile()][family]
 
 def resolve_h3_model_name(mode, available=None):
-    """Resolve the requested profile to an installed model without crossing FL2VA/REF2VA families."""
+    """Resolve a workflow-role model; explicit choices are never guessed or substituted."""
     requested = get_h3_model_name(mode)
     available = list(available if available is not None else comfy_unet_models())
     if not available or requested in available:
         return requested
+    family = 'ref2va' if mode == 'r2v' else 'fl2va'
+    if str(CONFIG.get(f'h3_{family}_model') or '').strip():
+        raise ValueError(f'ComfyUI 未检测到所选 H3 模型: {requested}')
     family_matches = []
     for name in available:
         lower = name.lower().replace('-', '_')
@@ -523,7 +561,7 @@ def resolve_h3_model_name(mode, available=None):
     return selected
 
 def apply_h3_model(workflow, mode):
-    """将用户选择的模型档位写入工作流；r2v 与 fl2va 自动配对。"""
+    """将各工作流用途槽位选中的模型写入对应工作流。"""
     model_name = resolve_h3_model_name(mode)
     loaders = [node for node in workflow.values()
                if isinstance(node, dict) and node.get('class_type') == 'UNETLoader']
@@ -534,14 +572,25 @@ def apply_h3_model(workflow, mode):
     return model_name
 
 def comfy_unet_models():
+    # ComfyUI does not publish reliable architecture metadata for arbitrary
+    # community UNET names. Return its complete loader enum and let users map
+    # any candidate to either workflow role; runtime errors remain explicit.
+    return comfy_loader_models('UNETLoader')
+
+def comfy_loader_models(class_type):
+    """Return exact model options exposed by one connected ComfyUI loader."""
     try:
-        r = requests.get(f"{comfy_url()}/object_info/UNETLoader", timeout=5)
+        encoded = requests.utils.quote(class_type, safe='')
+        r = requests.get(f"{comfy_url()}/object_info/{encoded}", timeout=5)
         r.raise_for_status()
-        options = r.json()['UNETLoader']['input']['required']['unet_name'][0]
-        return sorted(name for name in options if isinstance(name, str)
-                      and 'minimax' in name.lower() and 'h3' in name.lower())
+        schema = r.json()[class_type]['input']['required']
+        for input_name in ('unet_name', 'ckpt_name'):
+            options = schema.get(input_name, [[]])[0]
+            if isinstance(options, list):
+                return sorted(name for name in options if isinstance(name, str))
     except Exception:
-        return []
+        pass
+    return []
 
 def ensure_comfyui(max_wait=300):
     """Ensure ComfyUI is online; external mode never starts or stops user services."""
@@ -734,11 +783,12 @@ def runtime_preflight():
         checks['llm']['files'] = {
             'server': os.path.isfile(llama_server_path()),
             'model': os.path.isfile(qwen_model_path()),
-            'mmproj': os.path.isfile(qwen_mmproj_path()),
+            'mmproj_optional': os.path.isfile(qwen_mmproj_path()),
         }
     checks['llm']['host_managed'] = (llm_host_managed
                                      if checks['llm']['mode'] == 'managed' else False)
-    llm_files_ready = all(checks['llm'].get('files', {}).values()) if checks['llm'].get('files') else True
+    llm_files = checks['llm'].get('files', {})
+    llm_files_ready = all(llm_files.get(key) for key in ('server', 'model')) if llm_files else True
     llm_start_available = (llm_host_managed or llm_files_ready)
     messages = []
     if not comfy_online:
@@ -1056,15 +1106,90 @@ ASPECT_IMG_SIZE = {
     "4:3 (Standard)":    (1088, 816),
 }
 
-def load_t2i_workflow():
-    with open(os.path.join(WORKFLOWS_DIR, 't2i_qwen2512.json'), 'r', encoding='utf-8') as f:
-        return json.load(f)
+def image_workflow_files():
+    try:
+        return sorted(name for name in os.listdir(WORKFLOWS_DIR)
+                      if re.fullmatch(r't2i_[A-Za-z0-9_.-]+\.json', name)
+                      and os.path.isfile(os.path.join(WORKFLOWS_DIR, name)))
+    except OSError:
+        return []
+
+def get_image_workflow_name():
+    selected = str(CONFIG.get('image_workflow') or 't2i_qwen2512.json').strip()
+    return selected if selected in image_workflow_files() else 't2i_qwen2512.json'
+
+def load_t2i_workflow(name=None):
+    selected = name or get_image_workflow_name()
+    if selected not in image_workflow_files():
+        raise ValueError('未知的生图工作流')
+    with open(os.path.join(WORKFLOWS_DIR, selected), 'r', encoding='utf-8') as f:
+        workflow = json.load(f)
+    if not isinstance(workflow.get('json'), dict) or not isinstance(workflow.get('map'), dict):
+        raise ValueError(f'生图工作流格式无效: {selected}')
+    return workflow
+
+def image_model_loader(workflow):
+    """Find the primary diffusion/checkpoint loader used by a T2I adapter."""
+    for node_id, node in workflow.get('json', {}).items():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get('inputs') or {}
+        for input_name in ('unet_name', 'ckpt_name'):
+            if isinstance(inputs.get(input_name), str):
+                return node_id, node.get('class_type', ''), input_name, inputs[input_name]
+    return None
+
+def image_workflow_catalog():
+    catalog = []
+    for name in image_workflow_files():
+        try:
+            workflow = load_t2i_workflow(name)
+            loader = image_model_loader(workflow)
+            if not loader:
+                continue
+            _, class_type, input_name, default_model = loader
+            meta = workflow.get('meta') or {}
+            options = comfy_loader_models(class_type)
+            prefix = str(meta.get('model_prefix') or '').replace('\\', '/').strip('/')
+            if prefix:
+                options = [item for item in options
+                           if item.replace('\\', '/').startswith(prefix + '/')]
+            catalog.append({
+                'id': name,
+                'label': str(meta.get('label') or os.path.splitext(name)[0]),
+                'family': str(meta.get('family') or 'custom'),
+                'loader': class_type,
+                'input': input_name,
+                'default_model': default_model,
+                'models': options,
+            })
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+    return catalog
+
+def apply_image_model(workflow):
+    selected = str(CONFIG.get('image_model') or '').strip()
+    loader = image_model_loader(workflow)
+    if not selected:
+        return loader[3] if loader else ''
+    if not loader:
+        raise ValueError('生图工作流中未找到模型加载器')
+    node_id, class_type, input_name, default_model = loader
+    available = comfy_loader_models(class_type)
+    if available and selected not in available:
+        raise ValueError(f'ComfyUI 未检测到所选生图模型: {selected}')
+    workflow['json'][node_id].setdefault('inputs', {})[input_name] = selected
+    return selected
 
 def gen_image(prompt, width=None, height=None, seed=None, save_name=None, progress_cb=None,
               project_pid=None, run_id=None):
     """千问2512生成参考图，返回本地保存路径。尺寸默认跟随全局画幅设置"""
     t2i = load_t2i_workflow()
     wf = copy.deepcopy(t2i['json'])
+    try:
+        apply_image_model({'json': wf, 'map': t2i['map']})
+    except ValueError as exc:
+        return None, str(exc)
     missing = comfy_missing_node_types(wf)
     if missing:
         hint = "；请安装并启用 ComfyUI-GGUF" if any('gguf' in x.lower() for x in missing) else ""
@@ -3820,6 +3945,11 @@ def api_config():
             }), 403
         if 'h3_model_profile' in data and data['h3_model_profile'] not in H3_MODEL_PROFILES:
             return jsonify({"error": "未知的H3模型档位"}), 400
+        if 'image_workflow' in data and data['image_workflow'] not in image_workflow_files():
+            return jsonify({"error": "未知的生图工作流"}), 400
+        for key in ('h3_fl2va_model', 'h3_ref2va_model', 'image_model'):
+            if key in data and (not isinstance(data[key], str) or len(data[key]) > 500):
+                return jsonify({"error": f"{key} 必须是有效的模型名称"}), 400
         for key in ('comfyui_runtime_mode', 'local_llm_runtime_mode'):
             if key in data and data[key] not in ('managed', 'external'):
                 return jsonify({"error": f"{key} 只支持 managed 或 external"}), 400
@@ -3855,7 +3985,48 @@ def api_h3_models():
             "fl2va": profile['fl2va'],
             "ref2va": profile['ref2va'],
         })
-    return jsonify({"selected": get_h3_model_profile(), "profiles": profiles, "models": sorted(available)})
+    return jsonify({
+        "selected": get_h3_model_profile(), "profiles": profiles, "models": sorted(available),
+        "selected_fl2va": CONFIG.get('h3_fl2va_model', ''),
+        "selected_ref2va": CONFIG.get('h3_ref2va_model', ''),
+    })
+
+@app.route('/api/models')
+def api_models():
+    """Return model choices discovered from the local runtime and connected ComfyUI."""
+    base, _, _ = get_llm_endpoint()
+    service_models = []
+    try:
+        response = requests.get(f"{base}/models", timeout=5)
+        response.raise_for_status()
+        service_models = sorted({str(item.get('id')) for item in response.json().get('data', [])
+                                 if isinstance(item, dict) and item.get('id')})
+    except Exception:
+        pass
+    video_models = comfy_unet_models()
+    return jsonify({
+        'llm': {
+            'local_files': local_llm_models(),
+            'service_models': service_models,
+            'selected_path': CONFIG.get('qwen_model_path', ''),
+            'selected_name': (CONFIG.get('custom_model', '') if CONFIG.get('llm_mode') == 'custom'
+                              else CONFIG.get('local_llm_model', '')),
+        },
+        'video': {
+            'models': video_models,
+            # Compatibility aliases for older pages. Both workflow roles now
+            # intentionally receive the same unfiltered ComfyUI candidate set.
+            'fl2va': video_models,
+            'ref2va': video_models,
+            'selected_fl2va': CONFIG.get('h3_fl2va_model', ''),
+            'selected_ref2va': CONFIG.get('h3_ref2va_model', ''),
+        },
+        'image': {
+            'workflows': image_workflow_catalog(),
+            'selected_workflow': get_image_workflow_name(),
+            'selected_model': CONFIG.get('image_model', ''),
+        },
+    })
 
 @app.route('/api/status')
 def api_status():

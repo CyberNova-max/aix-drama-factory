@@ -29,6 +29,9 @@ AIX 短剧工厂是面向本地 AI 视频生产的 Web 工作台，把故事/剧
 - 提示词批处理保留已成功片段，后续只重试失败或无效片段。
 - 纯动作/无台词标记与真实台词分离，源台词确定性放入 Storyboard 且只出现一次。
 - 浏览器通过后端 `/api/comfy/queue` 代理读取队列，不再直连写死的 ComfyUI 端口。
+- 设置页可扫描并选择本地 GGUF 大语言模型，以及 ComfyUI 已安装的 H3 FL2VA、REF2VA/Remix 视频模型。
+- H3 的两个选择框代表“文生/首帧工作流”和“多参考工作流”用途槽位，共用同一份完整 UNET 候选；允许同模型复用、交叉选择和 Feihou、Dsiwa 等社区命名模型，兼容性由实际运行结果确认。
+- 生图模型按 `workflows/t2i_*.json` 工作流适配器分组选择；不同架构必须配套正确的文本编码器、VAE 和采样图，不能仅把 Qwen 模型文件名替换为 Flux、Z-Image 或 Krea。
 
 完整变更见 [CHANGELOG.md](CHANGELOG.md)。
 
