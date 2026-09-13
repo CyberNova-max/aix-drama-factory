@@ -3858,6 +3858,7 @@ def api_status():
     except Exception:
         llm_ok = False
     return jsonify({
+        "version": app_version(),
         "llm_online": llm_ok, "llm_endpoint": base, "llm_model": model,
         "comfyui_online": comfy_check(), "comfyui_url": comfy_url(),
         "ffmpeg": bool(find_ffmpeg()), "acceleration": acceleration_status(),
