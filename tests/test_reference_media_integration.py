@@ -1,8 +1,13 @@
 """Opt-in real FFmpeg tests using synthetic, temporary media only."""
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
+
+ROOT = str(Path(__file__).resolve().parents[1])
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 from reference_media import (ReferenceError, detect_shots, extract_frames,
                              make_proxy, probe_video, run_media)
@@ -89,3 +94,7 @@ class RealMediaTests(unittest.TestCase):
                 probe_video(source, FFPROBE, lambda: None)
         with self.assertRaises(ReferenceError):
             probe_video(self.color_video(), FFPROBE, lambda: None, max_seconds=1)
+
+
+if __name__ == '__main__':
+    unittest.main()

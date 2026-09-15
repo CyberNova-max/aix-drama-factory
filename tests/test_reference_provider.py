@@ -2,9 +2,14 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+import sys
 import tempfile
 import threading
 import unittest
+
+ROOT = str(Path(__file__).resolve().parents[1])
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 from reference_api import analyze_shot
 from reference_media import ReferenceError
@@ -77,3 +82,7 @@ class ProviderTests(unittest.TestCase):
                 raise RuntimeError('stopped')
         with self.assertRaisesRegex(RuntimeError, 'stopped'):
             analyze_shot(self.provider, self.frames, self.root, check)
+
+
+if __name__ == '__main__':
+    unittest.main()
